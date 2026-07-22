@@ -12,6 +12,7 @@ constexpr uint8_t FLAG_SENSOR_OK = 0x01;
 constexpr uint8_t FLAG_PRESSURE_OK = 0x02;
 constexpr uint32_t PAIR_REQUEST_MAGIC = 0x50414952;   // "PAIR"
 constexpr uint32_t PAIR_RESPONSE_MAGIC = 0x50414944;  // "PAID"
+constexpr uint32_t PAIR_BEACON_MAGIC = 0x42454143;    // "BEAC"
 constexpr uint32_t UNPAIR_MAGIC = 0x554E5041;         // "UNPA"
 constexpr uint32_t READING_ACK_MAGIC = 0x41434B52;    // "ACKR"
 
@@ -45,6 +46,16 @@ struct __attribute__((packed)) PairResponse {
   uint8_t reserved;
   uint8_t controllerMac[6];
   uint32_t nonce;
+  uint32_t checksum;
+};
+
+struct __attribute__((packed)) PairBeacon {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t assignedNodeId;
+  uint8_t wifiChannel;
+  uint8_t reserved;
+  uint8_t controllerMac[6];
   uint32_t checksum;
 };
 
@@ -96,6 +107,13 @@ inline bool valid(const PairRequest &message) {
 
 inline bool valid(const PairResponse &message) {
   return message.magic == PAIR_RESPONSE_MAGIC && message.version == VERSION &&
+         message.assignedNodeId >= 1 && message.assignedNodeId <= NODE_COUNT &&
+         message.wifiChannel >= 1 && message.wifiChannel <= 13 &&
+         message.checksum == messageChecksum(message);
+}
+
+inline bool valid(const PairBeacon &message) {
+  return message.magic == PAIR_BEACON_MAGIC && message.version == VERSION &&
          message.assignedNodeId >= 1 && message.assignedNodeId <= NODE_COUNT &&
          message.wifiChannel >= 1 && message.wifiChannel <= 13 &&
          message.checksum == messageChecksum(message);

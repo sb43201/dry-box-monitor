@@ -11,8 +11,8 @@
 #include "protocol.h"
 
 namespace {
-constexpr uint8_t SDA_PIN = 4;
-constexpr uint8_t SCL_PIN = 5;
+constexpr uint8_t SDA_PIN = 3;
+constexpr uint8_t SCL_PIN = 4;
 constexpr uint8_t PAIR_BUTTON_PIN = 9;  // BOOT button, active low
 constexpr uint8_t ONBOARD_LED_PIN = 8;  // ESP32-C3 Super Mini blue LED, active low
 constexpr uint8_t LED_ON = LOW;
@@ -50,6 +50,8 @@ uint32_t buttonDownMs = 0;
 bool buttonHandled = false;
 volatile bool remoteUnpairRequested = false;
 uint32_t ledOffAtMs = 0;
+bool controllerDiscovered = false;
+uint8_t discoveredControllerMac[6]{};
 float lastTemperatureC = NAN;
 float lastHumidityRh = NAN;
 uint32_t lastDisplayedSequence = 0;
@@ -113,7 +115,9 @@ void addPeer(const uint8_t *mac) {
   memcpy(peer.peer_addr, mac, 6);
   peer.channel = 0;
   peer.encrypt = false;
-  esp_now_add_peer(&peer);
+  const esp_err_t result = esp_now_add_peer(&peer);
+  Serial.printf("[radio] add peer %02X:%02X:%02X:%02X:%02X:%02X result=%d\n", mac[0], mac[1], mac[2], mac[3],
+                mac[4], mac[5], static_cast<int>(result));
 }
 
 void savePairing() {
@@ -134,6 +138,8 @@ void clearPairing() {
   pairedChannel = 1;
   pairingChannel = 1;
   pairingNonce = esp_random();
+  controllerDiscovered = false;
+  memset(discoveredControllerMac, 0, sizeof(discoveredControllerMac));
   savePairing();
   lastPairRequestMs = 0;
   Serial.println("[pair] Pairing cleared; advertising for a controller");
@@ -144,7 +150,7 @@ void loadPairing() {
   preferences.begin("drybox", true);
   paired = preferences.getBool("paired", false);
   nodeId = preferences.getUChar("nodeId", 0);
-  const size_t macLength = preferences.getBytesLength("ctrlMac");
+  const size_t macLength = preferences.isKey("ctrlMac") ? preferences.getBytesLength("ctrlMac") : 0;
   if (paired && macLength == sizeof(controllerMac)) preferences.getBytes("ctrlMac", controllerMac, sizeof(controllerMac));
   else paired = false;
   preferences.end();
@@ -167,20 +173,36 @@ bool startSensor() {
 }
 
 void sendPairRequest() {
-  esp_wifi_set_channel(pairingChannel, WIFI_SECOND_CHAN_NONE);
+  const uint8_t transmitChannel = pairingChannel;
+  const esp_err_t channelResult = controllerDiscovered ? ESP_OK : esp_wifi_set_channel(transmitChannel, WIFI_SECOND_CHAN_NONE);
+  delay(15);
   DryBoxProtocol::PairRequest request{};
   request.magic = DryBoxProtocol::PAIR_REQUEST_MAGIC;
   request.version = DryBoxProtocol::VERSION;
   request.nonce = pairingNonce;
   request.checksum = DryBoxProtocol::messageChecksum(request);
-  esp_now_send(BROADCAST_ADDRESS, reinterpret_cast<const uint8_t *>(&request), sizeof(request));
-  Serial.printf("[pair] Pairing request on Wi-Fi channel %u\n", pairingChannel);
+  esp_err_t sendResult = ESP_OK;
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+    const uint8_t *destination = controllerDiscovered ? discoveredControllerMac : BROADCAST_ADDRESS;
+    sendResult = esp_now_send(destination, reinterpret_cast<const uint8_t *>(&request), sizeof(request));
+    Serial.printf("[pair] %s request channel=%u attempt=%u setChannel=%d send=%d nonce=%lu\n",
+                  controllerDiscovered ? "unicast" : "broadcast", transmitChannel,
+                  attempt + 1, static_cast<int>(channelResult), static_cast<int>(sendResult),
+                  static_cast<unsigned long>(request.nonce));
+    delay(40);
+  }
   pairingChannel = pairingChannel >= 13 ? 1 : pairingChannel + 1;
   drawOled("PAIR REQUEST");
 }
 
 void sendReading() {
   if (!paired) return;
+  const esp_err_t channelResult = esp_wifi_set_channel(pairedChannel, WIFI_SECOND_CHAN_NONE);
+  uint8_t actualChannel = 0;
+  wifi_second_chan_t secondaryChannel = WIFI_SECOND_CHAN_NONE;
+  const esp_err_t readChannelResult = esp_wifi_get_channel(&actualChannel, &secondaryChannel);
+  Serial.printf("[radio] tx channel saved=%u actual=%u set=%d get=%d\n", pairedChannel, actualChannel,
+                static_cast<int>(channelResult), static_cast<int>(readChannelResult));
   DryBoxProtocol::SensorPacket packet{};
   packet.magic = DryBoxProtocol::MAGIC;
   packet.version = DryBoxProtocol::VERSION;
@@ -232,18 +254,35 @@ void sendReading() {
 
   packet.checksum = DryBoxProtocol::packetChecksum(packet);
   const esp_err_t result = esp_now_send(controllerMac, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
-  if (result == ESP_OK) flashTransmitLed();
+  delay(25);
+  const esp_err_t broadcastResult =
+      esp_now_send(BROADCAST_ADDRESS, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+  if (result == ESP_OK || broadcastResult == ESP_OK) flashTransmitLed();
   lastDisplayedSequence = packet.sequence;
   drawOled(result == ESP_OK ? "TX QUEUED" : "TX FAILED");
-  Serial.printf("[send] node=%u seq=%lu sensor=%s pressure=%s temp=%.2fC/%.2fF humidity=%.2f%% pressureHpa=%.2f result=%s\n",
+  Serial.printf("[send] node=%u seq=%lu sensor=%s pressure=%s temp=%.2fC/%.2fF humidity=%.2f%% pressureHpa=%.2f unicast=%s broadcast=%s\n",
                 packet.nodeId, static_cast<unsigned long>(packet.sequence),
                 packet.flags & DryBoxProtocol::FLAG_SENSOR_OK ? "OK" : "ERROR",
                 packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK ? "OK" : "N/A", packet.temperatureC,
                 packet.temperatureC * 9.0f / 5.0f + 32.0f, packet.humidityRh, packet.pressureHpa,
-                result == ESP_OK ? "queued" : "failed");
+                result == ESP_OK ? "queued" : "failed", broadcastResult == ESP_OK ? "queued" : "failed");
 }
 
 void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
+  if (length == sizeof(DryBoxProtocol::PairBeacon)) {
+    DryBoxProtocol::PairBeacon beacon;
+    memcpy(&beacon, data, sizeof(beacon));
+    if (!paired && DryBoxProtocol::valid(beacon) && sameMac(sourceMac, beacon.controllerMac)) {
+      memcpy(discoveredControllerMac, sourceMac, sizeof(discoveredControllerMac));
+      controllerDiscovered = true;
+      pairingChannel = beacon.wifiChannel;
+      addPeer(discoveredControllerMac);
+      lastPairRequestMs = 0;
+      Serial.printf("[pair] controller beacon received; using unicast to %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    sourceMac[0], sourceMac[1], sourceMac[2], sourceMac[3], sourceMac[4], sourceMac[5]);
+    }
+    return;
+  }
   if (length == sizeof(DryBoxProtocol::PairResponse)) {
     DryBoxProtocol::PairResponse response;
     memcpy(&response, data, sizeof(response));
@@ -253,11 +292,13 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
     nodeId = response.assignedNodeId;
     pairedChannel = response.wifiChannel;
     paired = true;
+    const esp_err_t channelResult = esp_wifi_set_channel(pairedChannel, WIFI_SECOND_CHAN_NONE);
     addPeer(controllerMac);
     savePairing();
     lastSendMs = 0;
     oledDirty = true;
-    Serial.printf("[pair] Paired as ACE %u\n", nodeId);
+    Serial.printf("[pair] Paired as ACE %u on channel %u setChannel=%d\n", nodeId, pairedChannel,
+                  static_cast<int>(channelResult));
     return;
   }
 
@@ -284,6 +325,7 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
 bool startEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  WiFi.setSleep(false);
   Serial.printf("[radio] MAC %s\n", WiFi.macAddress().c_str());
   if (esp_now_init() != ESP_OK) return false;
   esp_now_register_recv_cb(onPacket);

@@ -36,6 +36,7 @@ constexpr uint32_t PACKET_REDRAW_DELAY_MS = 250;
 constexpr uint8_t LOCAL_I2C_SDA = 32;
 constexpr uint8_t LOCAL_I2C_SCL = 25;
 constexpr uint32_t LOCAL_SENSOR_INTERVAL_MS = 30000;
+constexpr uint8_t BROADCAST_ADDRESS[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 constexpr uint16_t COLOR_BG = 0x0841;
 constexpr uint16_t COLOR_PANEL = 0x10A2;
@@ -54,6 +55,7 @@ struct NodeState {
 struct PendingPairRequest {
   DryBoxProtocol::PairRequest request{};
   uint8_t sourceMac[6]{};
+  uint8_t receivedChannel = 1;
   bool pending = false;
 };
 
@@ -114,6 +116,7 @@ WeatherClient weatherClient;
 WeatherData weatherData;
 String weatherError;
 uint32_t lastWeatherAttemptMs = 0;
+uint32_t lastPairBeaconMs = 0;
 constexpr uint32_t WEATHER_INTERVAL_MS = 20UL * 60UL * 1000UL;
 Adafruit_AHTX0 localAht;
 Adafruit_BMP280 localBmp;
@@ -761,6 +764,8 @@ void startWebServer() {
     overviewPage = slot / 5;
     pairingActive = true;
     pairingEndsMs = millis() + 60000;
+    Serial.printf("[pair] LISTENING from web slot=ACE %u controllerChannel=%u\n", selectedPairSlot + 1,
+                  WiFi.channel());
     webServer.send(200, "text/plain", "Pairing enabled for 60 seconds");
   });
   webServer.on("/unpair", HTTP_POST, []() {
@@ -858,6 +863,8 @@ void handleTouch() {
       } else {
         pairingActive = !pairingActive;
         pairingEndsMs = millis() + 60000;
+        Serial.printf("[pair] %s slot=ACE %u controllerChannel=%u\n", pairingActive ? "LISTENING" : "CANCELLED",
+                      selectedPairSlot + 1, WiFi.channel());
       }
     } else if (y >= 342 && y < 412 && x >= 160) {
       pairingActive = false;
@@ -919,13 +926,23 @@ void handleTouch() {
 }
 
 void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
+  Serial.printf("[espnow-rx] mac=%02X:%02X:%02X:%02X:%02X:%02X length=%d\n", sourceMac[0], sourceMac[1],
+                sourceMac[2], sourceMac[3], sourceMac[4], sourceMac[5], length);
   if (length == sizeof(DryBoxProtocol::PairRequest)) {
     DryBoxProtocol::PairRequest request;
     memcpy(&request, data, sizeof(request));
-    if (!pairingActive || slotPaired[selectedPairSlot] || !DryBoxProtocol::valid(request)) return;
+    if (!pairingActive || !DryBoxProtocol::valid(request)) return;
+    if (slotPaired[selectedPairSlot] && memcmp(sourceMac, pairedMacs[selectedPairSlot], 6) != 0) return;
+    uint8_t actualChannel = 1;
+    wifi_second_chan_t secondaryChannel = WIFI_SECOND_CHAN_NONE;
+    esp_wifi_get_channel(&actualChannel, &secondaryChannel);
+    Serial.printf("[pair] request mac=%02X:%02X:%02X:%02X:%02X:%02X slot=ACE %u channel=%u nonce=%lu\n",
+                  sourceMac[0], sourceMac[1], sourceMac[2], sourceMac[3], sourceMac[4], sourceMac[5],
+                  selectedPairSlot + 1, actualChannel, static_cast<unsigned long>(request.nonce));
     portENTER_CRITICAL(&nodeMux);
     pendingPair.request = request;
     memcpy(pendingPair.sourceMac, sourceMac, 6);
+    pendingPair.receivedChannel = actualChannel;
     pendingPair.pending = true;
     portEXIT_CRITICAL(&nodeMux);
     return;
@@ -937,6 +954,10 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
 
   const uint8_t slot = packet.nodeId - 1;
   if (!slotPaired[slot] || memcmp(sourceMac, pairedMacs[slot], 6) != 0) return;
+  if (pairingActive && slot == selectedPairSlot) {
+    pairingActive = false;
+    Serial.printf("[pair] ACE %u confirmed by first sensor packet\n", slot + 1);
+  }
 
   const float packetTemperatureF = packet.temperatureC * 9.0f / 5.0f + 32.0f;
   Serial.printf("[receive] mac=%02X:%02X:%02X:%02X:%02X:%02X node=%u seq=%lu temp=%.2fC/%.2fF humidity=%.2f%% pressure=%.2fhPa flags=0x%02X\n",
@@ -1003,28 +1024,45 @@ void processPendingPair() {
   pendingPair.pending = false;
   portEXIT_CRITICAL(&nodeMux);
 
-  if (!pairingActive || slotPaired[selectedPairSlot]) return;
-  memcpy(pairedMacs[selectedPairSlot], request.sourceMac, 6);
+  if (!pairingActive) return;
+  if (slotPaired[selectedPairSlot] && memcmp(request.sourceMac, pairedMacs[selectedPairSlot], 6) != 0) return;
+  const bool newNode = !slotPaired[selectedPairSlot];
+  if (newNode) memcpy(pairedMacs[selectedPairSlot], request.sourceMac, 6);
   slotPaired[selectedPairSlot] = true;
   addPeer(request.sourceMac);
-  savePairedSlot(selectedPairSlot);
+  if (newNode) savePairedSlot(selectedPairSlot);
 
   DryBoxProtocol::PairResponse response{};
   response.magic = DryBoxProtocol::PAIR_RESPONSE_MAGIC;
   response.version = DryBoxProtocol::VERSION;
   response.assignedNodeId = selectedPairSlot + 1;
-  response.wifiChannel = WiFi.channel();
+  response.wifiChannel = request.receivedChannel;
   memcpy(response.controllerMac, localMac, 6);
   response.nonce = request.request.nonce;
   response.checksum = DryBoxProtocol::messageChecksum(response);
-  // Repeat the short response to make first-time pairing resilient to a lost radio frame.
-  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
-    esp_now_send(request.sourceMac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
-    delay(30);
+  // Keep pairing active until the node confirms with its first reading. Duplicate requests resend this response.
+  for (uint8_t attempt = 0; attempt < 5; ++attempt) {
+    const esp_err_t result = esp_now_send(request.sourceMac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
+    Serial.printf("[pair] response attempt=%u slot=ACE %u queue=%s\n", attempt + 1, selectedPairSlot + 1,
+                  result == ESP_OK ? "OK" : "FAILED");
+    delay(50);
   }
-  pairingActive = false;
   packetPendingRedraw = true;
   redraw();
+}
+
+void sendPairBeacon() {
+  DryBoxProtocol::PairBeacon beacon{};
+  beacon.magic = DryBoxProtocol::PAIR_BEACON_MAGIC;
+  beacon.version = DryBoxProtocol::VERSION;
+  beacon.assignedNodeId = selectedPairSlot + 1;
+  wifi_second_chan_t secondaryChannel = WIFI_SECOND_CHAN_NONE;
+  esp_wifi_get_channel(&beacon.wifiChannel, &secondaryChannel);
+  memcpy(beacon.controllerMac, localMac, sizeof(localMac));
+  beacon.checksum = DryBoxProtocol::messageChecksum(beacon);
+  const esp_err_t result = esp_now_send(BROADCAST_ADDRESS, reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
+  Serial.printf("[pair] beacon slot=ACE %u channel=%u send=%d\n", selectedPairSlot + 1, beacon.wifiChannel,
+                static_cast<int>(result));
 }
 }  // namespace
 
@@ -1063,7 +1101,7 @@ void setup() {
   for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
     char key[8];
     snprintf(key, sizeof(key), "mac%u", i + 1);
-    if (preferences.getBytesLength(key) == 6) {
+    if (preferences.isKey(key) && preferences.getBytesLength(key) == 6) {
       preferences.getBytes(key, pairedMacs[i], 6);
       slotPaired[i] = true;
     }
@@ -1073,6 +1111,7 @@ void setup() {
   if (warningLimitRh <= goodLimitRh || warningLimitRh > 80) warningLimitRh = 45;
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.macAddress(localMac);
   Serial.printf("[radio] Display MAC %s\n", WiFi.macAddress().c_str());
   if (esp_now_init() != ESP_OK) {
@@ -1083,6 +1122,7 @@ void setup() {
   }
   esp_now_register_recv_cb(onPacket);
   esp_now_register_send_cb(onSent);
+  addPeer(BROADCAST_ADDRESS);
   for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
     if (slotPaired[i]) addPeer(pairedMacs[i]);
   }
@@ -1109,6 +1149,10 @@ void loop() {
   processPendingPair();
   processPendingReadingAck();
   const uint32_t now = millis();
+  if (pairingActive && (lastPairBeaconMs == 0 || now - lastPairBeaconMs >= 500)) {
+    lastPairBeaconMs = now;
+    sendPairBeacon();
+  }
   if (now - lastLocalSensorMs >= LOCAL_SENSOR_INTERVAL_MS) {
     readLocalSensor();
     if (weatherScreen) redraw();

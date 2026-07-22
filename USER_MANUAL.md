@@ -20,12 +20,12 @@ Each sensor node can use a 0.91-inch 128x32 SSD1306 I2C OLED with a white displa
 |---|---|
 | VCC | 3.3V |
 | GND | GND |
-| SDA | GPIO4 |
-| SCL | GPIO5 |
+| SDA | GPIO3 |
+| SCL | GPIO4 |
 
 The expected I2C address is `0x3C`. The node detects the OLED automatically. It shows pairing status, assigned ACE number, Wi-Fi channel, temperature in °C and °F, humidity, packet number, and transmission status. The node operates normally if no OLED is connected.
 
-Each node may use either a standalone AHT20 or an AHT20/BMP280 combo module on the same GPIO4/GPIO5 I2C bus. The BMP280 is detected automatically at address `0x76` or `0x77`. A combo node adds raw BMP280 temperature and pressure to serial diagnostics and transmits pressure in the existing packet field; a standalone AHT20 node reports the BMP280 as not installed and otherwise works normally.
+Each node may use either a standalone AHT20 or an AHT20/BMP280 combo module on the same GPIO3/GPIO4 I2C bus. The BMP280 is detected automatically at address `0x76` or `0x77`. A combo node adds raw BMP280 temperature and pressure to serial diagnostics and transmits pressure in the existing packet field; a standalone AHT20 node reports the BMP280 as not installed and otherwise works normally.
 
 ## 2. Controls and indicators
 
