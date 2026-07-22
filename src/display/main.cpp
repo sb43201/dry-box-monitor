@@ -64,8 +64,10 @@ struct PendingReadingAck {
 };
 
 struct LocalSensorReading {
+  float rawTemperatureC = NAN;
   float temperatureC = NAN;
   float humidityRh = NAN;
+  float bmpTemperatureC = NAN;
   float pressureHpa = NAN;
   bool ahtOk = false;
   bool bmpOk = false;
@@ -119,6 +121,7 @@ LocalSensorReading localReading;
 uint32_t lastLocalSensorMs = 0;
 bool localAhtFound = false;
 bool localBmpFound = false;
+float localTemperatureOffsetC = 0.0f;
 int touchMinX = DEFAULT_TOUCH_MIN_X;
 int touchMaxX = DEFAULT_TOUCH_MAX_X;
 int touchMinY = DEFAULT_TOUCH_MIN_Y;
@@ -204,14 +207,41 @@ void readLocalSensor() {
     localAht.getEvent(&humidity, &temperature);
     localReading.ahtOk = isfinite(temperature.temperature) && isfinite(humidity.relative_humidity);
     if (localReading.ahtOk) {
-      localReading.temperatureC = temperature.temperature;
+      localReading.rawTemperatureC = temperature.temperature;
+      localReading.temperatureC = localReading.rawTemperatureC + localTemperatureOffsetC;
       localReading.humidityRh = humidity.relative_humidity;
     }
   }
   if (localBmpFound) {
+    const float bmpTemperature = localBmp.readTemperature();
     const float pressure = localBmp.readPressure() / 100.0f;
-    localReading.bmpOk = isfinite(pressure) && pressure > 300.0f && pressure < 1200.0f;
-    if (localReading.bmpOk) localReading.pressureHpa = pressure;
+    localReading.bmpOk = isfinite(bmpTemperature) && isfinite(pressure) && pressure > 300.0f && pressure < 1200.0f;
+    if (localReading.bmpOk) {
+      localReading.bmpTemperatureC = bmpTemperature;
+      localReading.pressureHpa = pressure;
+    }
+  }
+  if (localReading.ahtOk) {
+    const float rawF = localReading.rawTemperatureC * 9.0f / 5.0f + 32.0f;
+    const float correctedF = localReading.temperatureC * 9.0f / 5.0f + 32.0f;
+    Serial.printf("[AHT20] raw=%.2fC/%.2fF corrected=%.2fC/%.2fF offset=%+.2fC humidity=%.2f%%\n",
+                  localReading.rawTemperatureC, rawF, localReading.temperatureC, correctedF,
+                  localTemperatureOffsetC, localReading.humidityRh);
+  } else {
+    Serial.println("[AHT20] temperature/humidity read failed");
+  }
+  if (localReading.bmpOk) {
+    const float bmpTemperatureF = localReading.bmpTemperatureC * 9.0f / 5.0f + 32.0f;
+    Serial.printf("[BMP280] raw=%.2fC/%.2fF pressure=%.2fhPa\n", localReading.bmpTemperatureC, bmpTemperatureF,
+                  localReading.pressureHpa);
+  } else {
+    Serial.println("[BMP280] temperature/pressure read failed");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[wifi] ssid=%s rssi=%ddBm channel=%d ip=%s hostname=%s\n", WiFi.SSID().c_str(), WiFi.RSSI(),
+                  WiFi.channel(), WiFi.localIP().toString().c_str(), hostname.c_str());
+  } else {
+    Serial.printf("[wifi] disconnected status=%d\n", static_cast<int>(WiFi.status()));
   }
 }
 
@@ -239,7 +269,9 @@ void drawWelcome(const String &setupSsid) {
   tft.fillScreen(COLOR_BG);
   drawHeader("ACE DRY BOX MONITOR");
   tft.setTextColor(TFT_WHITE, COLOR_BG);
-  tft.drawString("Welcome", 18, 76, 6);
+  tft.setTextSize(2);
+  tft.drawString("Welcome", 18, 76, 4);
+  tft.setTextSize(1);
   tft.setTextColor(COLOR_MUTED, COLOR_BG);
   tft.drawString("Wi-Fi setup", 18, 142, 4);
   tft.setTextColor(TFT_WHITE, COLOR_BG);
@@ -307,6 +339,9 @@ void drawOverview() {
   for (const auto &node : snapshot) onlineCount += online(node, now) ? 1 : 0;
   snprintf(countText, sizeof(countText), "%u/10 ONLINE", onlineCount);
   drawHeader("DRY BOXES", countText);
+  tft.setTextColor(WiFi.status() == WL_CONNECTED ? COLOR_GOOD : COLOR_WARN, COLOR_HEADER);
+  const String wifiStatus = WiFi.status() == WL_CONNECTED ? "WiFi " + WiFi.localIP().toString() : "WiFi disconnected";
+  tft.drawString(wifiStatus, 12, 39, 1);
 
   constexpr int16_t firstY = 60;
   constexpr int16_t rowH = 70;
@@ -325,8 +360,9 @@ void drawOverview() {
     tft.drawString(nodeName(i), 24, y + 8, 4);
 
     if (sensorOk) {
-      char value[24];
-      snprintf(value, sizeof(value), "%.1f C", snapshot[i].packet.temperatureC);
+      char value[32];
+      const float temperatureF = snapshot[i].packet.temperatureC * 9.0f / 5.0f + 32.0f;
+      snprintf(value, sizeof(value), "%.1f C / %.1f F", snapshot[i].packet.temperatureC, temperatureF);
       tft.setTextColor(0xDFFF, COLOR_PANEL);
       tft.drawString(value, 24, y + 38, 2);
       snprintf(value, sizeof(value), "%.1f%%", snapshot[i].packet.humidityRh);
@@ -352,7 +388,13 @@ void drawOverview() {
 
 void drawWeather() {
   tft.fillScreen(COLOR_BG);
-  drawHeader("WEATHER", weatherLocation.c_str());
+  char dateTime[24] = "TIME SYNCING";
+  const time_t now = time(nullptr);
+  tm localTime{};
+  if (now > 100000 && localtime_r(&now, &localTime)) {
+    strftime(dateTime, sizeof(dateTime), "%b %d %I:%M %p", &localTime);
+  }
+  drawHeader(weatherLocation.c_str(), dateTime);
   const char unit = weatherImperial ? 'F' : 'C';
   if (!weatherApiKey.length()) {
     tft.setTextColor(COLOR_WARN, COLOR_BG);
@@ -368,8 +410,11 @@ void drawWeather() {
   } else {
     char value[40];
     tft.setTextColor(TFT_WHITE, COLOR_BG);
-    snprintf(value, sizeof(value), "%.1f %c", weatherData.current.temperature, unit);
+    snprintf(value, sizeof(value), "%.1f", weatherData.current.temperature);
     tft.drawString(value, 14, 68, 7);
+    const int16_t unitX = 14 + tft.textWidth(value, 7) + 7;
+    tft.drawCircle(unitX + 4, 77, 4, TFT_WHITE);
+    tft.drawString(String(unit), unitX + 12, 70, 4);
     tft.setTextColor(COLOR_MUTED, COLOR_BG);
     tft.drawString(weatherData.current.description, 16, 120, 4);
     snprintf(value, sizeof(value), "Feels %.0f%c   RH %.0f%%   Wind %.0f %s", weatherData.current.feelsLike, unit,
@@ -388,9 +433,10 @@ void drawWeather() {
   }
   tft.setTextColor(TFT_WHITE, COLOR_PANEL);
   if (localReading.ahtOk) {
-    const float roomTemp = weatherImperial ? localReading.temperatureC * 9.0f / 5.0f + 32.0f : localReading.temperatureC;
+    const float roomTempF = localReading.temperatureC * 9.0f / 5.0f + 32.0f;
     char roomValue[48];
-    snprintf(roomValue, sizeof(roomValue), "%.1f %c   %.1f%% RH", roomTemp, unit, localReading.humidityRh);
+    snprintf(roomValue, sizeof(roomValue), "%.1f C / %.1f F   %.1f%%", localReading.temperatureC, roomTempF,
+             localReading.humidityRh);
     tft.drawString(roomValue, 18, 220, 4);
   } else {
     tft.drawString("Sensor offline", 18, 220, 4);
@@ -416,8 +462,9 @@ void drawWeather() {
     tft.drawString(forecastValue, x + 37, 348, 1);
     tft.setTextDatum(TL_DATUM);
   }
-  fillButton(8, 418, 148, 51, "BACK", 0x3186);
-  fillButton(164, 418, 148, 51, "REFRESH", 0x056B);
+  fillButton(8, 418, 96, 51, "BACK", 0x3186);
+  fillButton(112, 418, 96, 51, weatherImperial ? "SHOW C" : "SHOW F", 0x04A8);
+  fillButton(216, 418, 96, 51, "REFRESH", 0x056B);
 }
 
 void drawDetail(uint8_t index) {
@@ -447,11 +494,12 @@ void drawDetail(uint8_t index) {
   }
 
   const uint16_t color = statusColor(node.packet.humidityRh);
-  char value[32];
+  char value[40];
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_WHITE, COLOR_BG);
-  snprintf(value, sizeof(value), "%.1f C", node.packet.temperatureC);
-  tft.drawString(value, 160, 125, 7);
+  const float temperatureF = node.packet.temperatureC * 9.0f / 5.0f + 32.0f;
+  snprintf(value, sizeof(value), "%.1f C / %.1f F", node.packet.temperatureC, temperatureF);
+  tft.drawString(value, 160, 125, 4);
   tft.setTextColor(color, COLOR_BG);
   snprintf(value, sizeof(value), "%.1f%% RH", node.packet.humidityRh);
   tft.drawString(value, 160, 220, 7);
@@ -684,14 +732,16 @@ body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margi
   page += weatherLongitude;
   page += F(R"HTML("><br><label>POSIX timezone </label><input name=tz size=35 value=")HTML");
   page += weatherTimezone;
-  page += "\"><br><label><input type=checkbox name=imperial" + String(weatherImperial ? " checked" : "") + "> Fahrenheit / mph</label><br><button>Save weather</button></form></div>";
+  page += "\"><br><label>AHT20 display temperature offset (&deg;C) </label><input type=number name=tempOffset min=-20 max=20 step=0.1 value=\"" +
+          String(localTemperatureOffsetC, 1) + "\"><br><label><input type=checkbox name=imperial" +
+          String(weatherImperial ? " checked" : "") + "> Fahrenheit / mph</label><br><button>Save weather</button></form></div>";
   page += F(R"HTML(<div class=panel><h2>Controller</h2><form method=post action=/hostname><label>Hostname </label><input name=host maxlength=32 pattern="[a-zA-Z0-9-]+" value=")HTML");
   page += hostname;
   page += F(R"HTML("><button>Save and restart</button></form><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
 <script>
 async function post(url){await fetch(url,{method:'POST'});setTimeout(load,300)}
 async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel;
-nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let v=n.sensorOk?`<div class=value>${n.temperatureC.toFixed(1)} C &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?(n.online?'SENSOR ERROR':'OFFLINE'):'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
+nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?(n.online?'SENSOR ERROR':'OFFLINE'):'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
 pairButtons.innerHTML=d.nodes.filter(n=>!n.paired).map(n=>`<button onclick="post('/pair?slot=${n.id}')">Pair ${n.name}</button>`).join('')||'All slots are paired.';}catch(e){connection.textContent='Controller unavailable';}}load();setInterval(load,3000);
 </script></body></html>)HTML");
   webServer.send(200, "text/html", page);
@@ -738,6 +788,7 @@ void startWebServer() {
     weatherLongitude = webServer.arg("lon");
     weatherTimezone = webServer.arg("tz");
     weatherImperial = webServer.hasArg("imperial");
+    localTemperatureOffsetC = constrain(webServer.arg("tempOffset").toFloat(), -20.0f, 20.0f);
     preferences.begin("drybox", false);
     preferences.putString("weatherKey", weatherApiKey);
     preferences.putString("weatherPlace", weatherLocation);
@@ -745,7 +796,9 @@ void startWebServer() {
     preferences.putString("weatherLon", weatherLongitude);
     preferences.putString("weatherTz", weatherTimezone);
     preferences.putBool("weatherImp", weatherImperial);
+    preferences.putFloat("localTempOff", localTemperatureOffsetC);
     preferences.end();
+    readLocalSensor();
     setenv("TZ", weatherTimezone.c_str(), 1);
     tzset();
     lastWeatherAttemptMs = 0;
@@ -775,8 +828,18 @@ void handleTouch() {
   if (!readTouch(x, y)) return;
 
   if (weatherScreen) {
-    if (y >= 410 && x < 160) weatherScreen = false;
-    else if (y >= 410) lastWeatherAttemptMs = 0;
+    if (y >= 410 && x < 108) {
+      weatherScreen = false;
+    } else if (y >= 410 && x < 212) {
+      weatherImperial = !weatherImperial;
+      preferences.begin("drybox", false);
+      preferences.putBool("weatherImp", weatherImperial);
+      preferences.end();
+      weatherData = WeatherData{};
+      lastWeatherAttemptMs = 0;
+    } else if (y >= 410) {
+      lastWeatherAttemptMs = 0;
+    }
     redraw();
     return;
   }
@@ -875,9 +938,10 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
   const uint8_t slot = packet.nodeId - 1;
   if (!slotPaired[slot] || memcmp(sourceMac, pairedMacs[slot], 6) != 0) return;
 
-  Serial.printf("[receive] mac=%02X:%02X:%02X:%02X:%02X:%02X node=%u seq=%lu temp=%.1fC rh=%.1f%% pressure=%.1fhPa flags=0x%02X\n",
+  const float packetTemperatureF = packet.temperatureC * 9.0f / 5.0f + 32.0f;
+  Serial.printf("[receive] mac=%02X:%02X:%02X:%02X:%02X:%02X node=%u seq=%lu temp=%.2fC/%.2fF humidity=%.2f%% pressure=%.2fhPa flags=0x%02X\n",
                 sourceMac[0], sourceMac[1], sourceMac[2], sourceMac[3], sourceMac[4], sourceMac[5], packet.nodeId,
-                static_cast<unsigned long>(packet.sequence), packet.temperatureC, packet.humidityRh,
+                static_cast<unsigned long>(packet.sequence), packet.temperatureC, packetTemperatureF, packet.humidityRh,
                 packet.pressureHpa, packet.flags);
 
   portENTER_CRITICAL(&nodeMux);
@@ -984,6 +1048,7 @@ void setup() {
   touchMinY = preferences.getInt("touchMinY", DEFAULT_TOUCH_MIN_Y);
   touchMaxY = preferences.getInt("touchMaxY", DEFAULT_TOUCH_MAX_Y);
   touchCalibrated = preferences.getBool("touchCal", false);
+  localTemperatureOffsetC = preferences.getFloat("localTempOff", 0.0f);
   preferences.end();
   if (!touchCalibrated) runTouchCalibration();
 

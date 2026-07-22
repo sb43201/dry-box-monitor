@@ -2,12 +2,15 @@
 
 PlatformIO firmware for up to ten wireless AHT20 sensor nodes and one Hosyond/LCDWiki E32R35T central touchscreen.
 
+For setup and day-to-day operation, see the [User Manual](USER_MANUAL.md).
+
 ## Hardware
 
 ### Sensor nodes (up to ten identical units)
 
 - ESP32-C3 Super Mini, 4 MB flash
-- AHT20 breakout
+- AHT20 breakout, or an AHT20/BMP280 combo module
+- Optional 0.91-inch 128x32 SSD1306 I2C OLED (white)
 - USB power
 
 | AHT20 | ESP32-C3 Super Mini |
@@ -16,6 +19,19 @@ PlatformIO firmware for up to ten wireless AHT20 sensor nodes and one Hosyond/LC
 | GND | GND |
 | SDA | GPIO4 |
 | SCL | GPIO5 |
+
+The node automatically detects an optional BMP280 at address `0x76` or `0x77`. AHT20-only and AHT20/BMP280 combo nodes use the same firmware. When present, BMP280 temperature and pressure are included in serial diagnostics and pressure is sent in the existing packet field.
+
+The optional OLED shares the same I2C bus:
+
+| SSD1306 OLED | ESP32-C3 Super Mini |
+|---|---|
+| VCC | 3.3V |
+| GND | GND |
+| SDA | GPIO4 |
+| SCL | GPIO5 |
+
+The firmware automatically detects a 128x32 display at I2C address `0x3C`. No setting or separate firmware is required. The OLED shows pairing state, ACE number, radio channel, temperature in both units, humidity, and transmission status.
 
 Keep the AHT20 inside the dry box and, when practical, keep the ESP32-C3 outside. Use a short four-wire cable. Do not power the module from 5 V.
 

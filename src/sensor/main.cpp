@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -21,11 +24,18 @@ constexpr uint32_t SENSOR_RETRY_MS = 5000;
 constexpr uint32_t UNPAIR_HOLD_MS = 5000;
 constexpr float TEMPERATURE_OFFSET_C = 0.0f;
 constexpr float HUMIDITY_OFFSET_RH = 0.0f;
+constexpr uint8_t OLED_ADDRESS = 0x3C;
+constexpr int16_t OLED_WIDTH = 128;
+constexpr int16_t OLED_HEIGHT = 32;
 constexpr uint8_t BROADCAST_ADDRESS[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 Preferences preferences;
 bool sensorReady = false;
+bool bmpReady = false;
+bool oledReady = false;
 bool paired = false;
 uint8_t nodeId = 0;
 uint8_t controllerMac[6]{};
@@ -40,6 +50,47 @@ uint32_t buttonDownMs = 0;
 bool buttonHandled = false;
 volatile bool remoteUnpairRequested = false;
 uint32_t ledOffAtMs = 0;
+float lastTemperatureC = NAN;
+float lastHumidityRh = NAN;
+uint32_t lastDisplayedSequence = 0;
+volatile bool oledDirty = false;
+
+void drawOled(const char *status) {
+  if (!oledReady) return;
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  if (paired) oled.printf("ACE %u  CH %u", nodeId, pairedChannel);
+  else oled.printf("PAIRING  CH %u", pairingChannel);
+  oled.setCursor(0, 8);
+  if (isfinite(lastTemperatureC)) {
+    const float temperatureF = lastTemperatureC * 9.0f / 5.0f + 32.0f;
+    oled.printf("%.1f C / %.1f F", lastTemperatureC, temperatureF);
+    oled.setCursor(0, 16);
+    oled.printf("Humidity %.1f%%", lastHumidityRh);
+  } else {
+    oled.print(sensorReady ? "Waiting for reading" : "AHT20 SENSOR ERROR");
+    oled.setCursor(0, 16);
+    oled.print(paired ? "Check sensor wiring" : "Seeking controller");
+  }
+  oled.setCursor(0, 24);
+  oled.printf("%s", status);
+  if (lastDisplayedSequence) oled.printf("  #%lu", static_cast<unsigned long>(lastDisplayedSequence));
+  oled.display();
+}
+
+void startOled() {
+  Wire.beginTransmission(OLED_ADDRESS);
+  if (Wire.endTransmission() != 0) {
+    oledReady = false;
+    Serial.printf("[display] SSD1306 128x32 at 0x%02X=not detected\n", OLED_ADDRESS);
+    return;
+  }
+  oledReady = oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS, false, false);
+  Serial.printf("[display] SSD1306 128x32 at 0x%02X=%s\n", OLED_ADDRESS, oledReady ? "ready" : "not detected");
+  drawOled("STARTING");
+}
 
 void flashTransmitLed() {
   digitalWrite(ONBOARD_LED_PIN, LED_ON);
@@ -86,6 +137,7 @@ void clearPairing() {
   savePairing();
   lastPairRequestMs = 0;
   Serial.println("[pair] Pairing cleared; advertising for a controller");
+  drawOled("PAIRING");
 }
 
 void loadPairing() {
@@ -108,7 +160,9 @@ void loadPairing() {
 bool startSensor() {
   lastSensorAttemptMs = millis();
   sensorReady = aht.begin(&Wire);
-  Serial.printf("[sensor] AHT20=%s on SDA=%u SCL=%u\n", sensorReady ? "ready" : "missing", SDA_PIN, SCL_PIN);
+  bmpReady = bmp.begin(0x76, 0x58) || bmp.begin(0x77, 0x58);
+  Serial.printf("[sensor-status] AHT20=%s BMP280=%s SDA=%u SCL=%u\n", sensorReady ? "ready" : "missing",
+                bmpReady ? "ready" : "not installed", SDA_PIN, SCL_PIN);
   return sensorReady;
 }
 
@@ -122,6 +176,7 @@ void sendPairRequest() {
   esp_now_send(BROADCAST_ADDRESS, reinterpret_cast<const uint8_t *>(&request), sizeof(request));
   Serial.printf("[pair] Pairing request on Wi-Fi channel %u\n", pairingChannel);
   pairingChannel = pairingChannel >= 13 ? 1 : pairingChannel + 1;
+  drawOled("PAIR REQUEST");
 }
 
 void sendReading() {
@@ -141,20 +196,51 @@ void sendReading() {
     sensors_event_t temperature;
     aht.getEvent(&humidity, &temperature);
     if (isfinite(temperature.temperature) && isfinite(humidity.relative_humidity)) {
+      const float rawTemperatureF = temperature.temperature * 9.0f / 5.0f + 32.0f;
       packet.temperatureC = temperature.temperature + TEMPERATURE_OFFSET_C;
       packet.humidityRh = constrain(humidity.relative_humidity + HUMIDITY_OFFSET_RH, 0.0f, 100.0f);
       packet.flags |= DryBoxProtocol::FLAG_SENSOR_OK;
+      lastTemperatureC = packet.temperatureC;
+      lastHumidityRh = packet.humidityRh;
+      const float correctedTemperatureF = packet.temperatureC * 9.0f / 5.0f + 32.0f;
+      Serial.printf("[AHT20] status=OK rawTemp=%.2fC/%.2fF rawHumidity=%.2f%% correctedTemp=%.2fC/%.2fF correctedHumidity=%.2f%%\n",
+                    temperature.temperature, rawTemperatureF, humidity.relative_humidity, packet.temperatureC,
+                    correctedTemperatureF, packet.humidityRh);
     } else {
       sensorReady = false;
+      Serial.println("[AHT20] status=READ_ERROR raw data invalid");
     }
+  } else {
+    Serial.println("[AHT20] status=MISSING no raw data");
+  }
+
+  if (bmpReady) {
+    const float bmpTemperatureC = bmp.readTemperature();
+    const float bmpPressureHpa = bmp.readPressure() / 100.0f;
+    if (isfinite(bmpTemperatureC) && isfinite(bmpPressureHpa) && bmpPressureHpa > 300.0f && bmpPressureHpa < 1200.0f) {
+      const float bmpTemperatureF = bmpTemperatureC * 9.0f / 5.0f + 32.0f;
+      packet.pressureHpa = bmpPressureHpa;
+      packet.flags |= DryBoxProtocol::FLAG_PRESSURE_OK;
+      Serial.printf("[BMP280] status=OK rawTemp=%.2fC/%.2fF rawPressure=%.2fhPa\n", bmpTemperatureC,
+                    bmpTemperatureF, bmpPressureHpa);
+    } else {
+      Serial.println("[BMP280] status=READ_ERROR raw data invalid");
+    }
+  } else {
+    Serial.println("[BMP280] status=NOT_INSTALLED pressure omitted");
   }
 
   packet.checksum = DryBoxProtocol::packetChecksum(packet);
   const esp_err_t result = esp_now_send(controllerMac, reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
   if (result == ESP_OK) flashTransmitLed();
-  Serial.printf("[send] node=%u seq=%lu temp=%.1fC rh=%.1f%% pressure=%.1fhPa result=%s\n", packet.nodeId,
-                static_cast<unsigned long>(packet.sequence), packet.temperatureC, packet.humidityRh,
-                packet.pressureHpa, result == ESP_OK ? "queued" : "failed");
+  lastDisplayedSequence = packet.sequence;
+  drawOled(result == ESP_OK ? "TX QUEUED" : "TX FAILED");
+  Serial.printf("[send] node=%u seq=%lu sensor=%s pressure=%s temp=%.2fC/%.2fF humidity=%.2f%% pressureHpa=%.2f result=%s\n",
+                packet.nodeId, static_cast<unsigned long>(packet.sequence),
+                packet.flags & DryBoxProtocol::FLAG_SENSOR_OK ? "OK" : "ERROR",
+                packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK ? "OK" : "N/A", packet.temperatureC,
+                packet.temperatureC * 9.0f / 5.0f + 32.0f, packet.humidityRh, packet.pressureHpa,
+                result == ESP_OK ? "queued" : "failed");
 }
 
 void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
@@ -170,6 +256,7 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
     addPeer(controllerMac);
     savePairing();
     lastSendMs = 0;
+    oledDirty = true;
     Serial.printf("[pair] Paired as ACE %u\n", nodeId);
     return;
   }
@@ -180,6 +267,7 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
     if (paired && sameMac(sourceMac, controllerMac) && DryBoxProtocol::valid(ack) && ack.nodeId == nodeId) {
       Serial.printf("[ack] controller accepted node=%u sequence=%lu status=%u\n", ack.nodeId,
                     static_cast<unsigned long>(ack.sequence), ack.status);
+      oledDirty = true;
     }
     return;
   }
@@ -231,6 +319,7 @@ void setup() {
   digitalWrite(ONBOARD_LED_PIN, LED_OFF);
   Wire.begin(SDA_PIN, SCL_PIN);
   startSensor();
+  startOled();
   loadPairing();
   pairingNonce = esp_random();
   if (!startEspNow()) {
@@ -239,6 +328,7 @@ void setup() {
     ESP.restart();
   }
   Serial.println(paired ? "[pair] Saved controller loaded" : "[pair] Unpaired; advertising");
+  drawOled(paired ? "READY" : "PAIRING");
 }
 
 void loop() {
@@ -252,6 +342,10 @@ void loop() {
     clearPairing();
   }
   handlePairButton();
+  if (oledDirty) {
+    oledDirty = false;
+    drawOled(paired ? "ACK / READY" : "PAIRING");
+  }
   if (!sensorReady && now - lastSensorAttemptMs >= SENSOR_RETRY_MS) startSensor();
 
   if (!paired && (lastPairRequestMs == 0 || now - lastPairRequestMs >= PAIR_REQUEST_INTERVAL_MS)) {
