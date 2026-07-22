@@ -2,6 +2,8 @@
 
 PlatformIO firmware for up to ten wireless AHT20 sensor nodes and one Hosyond/LCDWiki E32R35T central touchscreen.
 
+For setup and day-to-day operation, see the [User Manual](USER_MANUAL.md).
+
 ## Hardware
 
 ### Sensor nodes (up to ten identical units)
