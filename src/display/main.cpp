@@ -36,6 +36,9 @@ constexpr uint32_t PACKET_REDRAW_DELAY_MS = 250;
 constexpr uint8_t LOCAL_I2C_SDA = 32;
 constexpr uint8_t LOCAL_I2C_SCL = 25;
 constexpr uint32_t LOCAL_SENSOR_INTERVAL_MS = 30000;
+constexpr uint32_t WIFI_CHOICE_TIMEOUT_MS = 8000;
+constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
+constexpr uint8_t WIFI_RECONNECTS_BEFORE_RESTART = 6;
 constexpr uint32_t HISTORY_BUCKET_MS = 5UL * 60UL * 1000UL;
 constexpr uint16_t HISTORY_BUCKETS = 24 * 60 / 5;
 constexpr uint8_t BROADCAST_ADDRESS[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -135,6 +138,12 @@ WeatherData weatherData;
 String weatherError;
 uint32_t lastWeatherAttemptMs = 0;
 uint32_t lastPairBeaconMs = 0;
+uint32_t wifiDisconnectedSinceMs = 0;
+uint32_t lastWifiReconnectAttemptMs = 0;
+uint8_t wifiReconnectAttempts = 0;
+uint8_t lastConnectedWifiChannel = 0;
+bool wifiWasConnected = false;
+bool wifiSkippedAtStartup = false;
 constexpr uint32_t WEATHER_INTERVAL_MS = 20UL * 60UL * 1000UL;
 Adafruit_AHTX0 localAht;
 Adafruit_BMP280 localBmp;
@@ -306,8 +315,15 @@ void drawWelcome(const String &setupSsid) {
   tft.drawString("After setup, open:", 18, 302, 2);
   tft.setTextColor(COLOR_GOOD, COLOR_BG);
   tft.drawString("http://" + hostname + ".local", 18, 332, 4);
-  tft.setTextColor(TFT_WHITE, COLOR_BG);
-  tft.drawString("Then pair nodes in Settings", 18, 388, 2);
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
+  tft.drawString("Choose Wi-Fi or offline mode", 18, 378, 2);
+  tft.fillRoundRect(8, 410, 148, 54, 6, 0x04A8);
+  tft.fillRoundRect(164, 410, 148, 54, 6, 0x3186);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString("USE WIFI", 82, 437, 2);
+  tft.drawString("SKIP WIFI", 238, 437, 2);
+  tft.setTextDatum(TL_DATUM);
 }
 
 uint16_t statusColor(float humidity) {
@@ -446,7 +462,9 @@ void drawOverview() {
   snprintf(countText, sizeof(countText), "%u/10 ONLINE", onlineCount);
   drawHeader("DRY BOXES", countText);
   tft.setTextColor(WiFi.status() == WL_CONNECTED ? COLOR_GOOD : COLOR_WARN, COLOR_HEADER);
-  const String wifiStatus = WiFi.status() == WL_CONNECTED ? "WiFi " + WiFi.localIP().toString() : "WiFi disconnected";
+  const String wifiStatus = WiFi.status() == WL_CONNECTED
+                                ? "WiFi " + WiFi.localIP().toString()
+                                : (wifiSkippedAtStartup ? "WiFi offline mode" : "WiFi disconnected");
   tft.drawString(wifiStatus, 12, 39, 1);
 
   constexpr int16_t firstY = 60;
@@ -693,6 +711,30 @@ bool readTouch(int16_t &x, int16_t &y) {
   return true;
 }
 
+bool skipWifiSelected() {
+  const uint32_t choiceStartedMs = millis();
+  uint8_t previousSeconds = UINT8_MAX;
+  while (millis() - choiceStartedMs < WIFI_CHOICE_TIMEOUT_MS) {
+    const uint32_t remainingMs = WIFI_CHOICE_TIMEOUT_MS - (millis() - choiceStartedMs);
+    const uint8_t remainingSeconds = (remainingMs + 999) / 1000;
+    if (remainingSeconds != previousSeconds) {
+      previousSeconds = remainingSeconds;
+      tft.fillRect(8, 465, 304, 15, COLOR_BG);
+      tft.setTextDatum(BC_DATUM);
+      tft.setTextColor(COLOR_MUTED, COLOR_BG);
+      tft.drawString("Auto-start Wi-Fi in " + String(remainingSeconds) + "s", SCREEN_WIDTH / 2, 479, 1);
+      tft.setTextDatum(TL_DATUM);
+    }
+    int16_t x, y;
+    if (readTouch(x, y) && y >= 400) {
+      while (touch.touched()) delay(10);
+      return x >= SCREEN_WIDTH / 2;
+    }
+    delay(20);
+  }
+  return false;
+}
+
 void saveThresholds() {
   preferences.begin("drybox", false);
   preferences.putFloat("goodRh", goodLimitRh);
@@ -755,6 +797,14 @@ bool connectWifi() {
 
   const String setupSsid = setupNetworkName();
   drawWelcome(setupSsid);
+  if (skipWifiSelected()) {
+    wifiSkippedAtStartup = true;
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false, false);
+    Serial.println("[wifi] SKIPPED for this boot; ESP-NOW offline mode enabled");
+    return false;
+  }
   char hostnameBuffer[33], apiBuffer[65], latitudeBuffer[17], longitudeBuffer[17], locationBuffer[33], timezoneBuffer[65];
   hostname.toCharArray(hostnameBuffer, sizeof(hostnameBuffer));
   weatherApiKey.toCharArray(apiBuffer, sizeof(apiBuffer));
@@ -779,6 +829,7 @@ bool connectWifi() {
   manager.setConnectTimeout(20);
   manager.setConfigPortalTimeout(300);
   const bool connected = manager.autoConnect(setupSsid.c_str());
+  WiFi.setAutoReconnect(true);
   if (connected) {
     hostname = sanitizeHostname(hostnameParameter.getValue());
     weatherApiKey = apiParameter.getValue();
@@ -936,6 +987,66 @@ void startWebServer() {
   if (MDNS.begin(hostname.c_str())) MDNS.addService("http", "tcp", 80);
   Serial.println("[web] http://" + hostname + ".local");
   Serial.println("[web] http://" + WiFi.localIP().toString());
+}
+
+void handleWifiRecovery(uint32_t now) {
+  if (wifiSkippedAtStartup) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    const uint8_t currentChannel = WiFi.channel();
+    if (!wifiWasConnected) {
+      const uint32_t outageSeconds = wifiDisconnectedSinceMs ? (now - wifiDisconnectedSinceMs) / 1000UL : 0;
+      Serial.printf("[wifi] RECOVERED after %lus ssid=%s rssi=%ddBm channel=%u ip=%s\n",
+                    static_cast<unsigned long>(outageSeconds), WiFi.SSID().c_str(), WiFi.RSSI(), currentChannel,
+                    WiFi.localIP().toString().c_str());
+      wifiWasConnected = true;
+      wifiDisconnectedSinceMs = 0;
+      lastWifiReconnectAttemptMs = 0;
+      wifiReconnectAttempts = 0;
+      if (!webServerStarted) {
+        startWebServer();
+      } else {
+        MDNS.end();
+        if (MDNS.begin(hostname.c_str())) MDNS.addService("http", "tcp", 80);
+      }
+      setenv("TZ", weatherTimezone.c_str(), 1);
+      tzset();
+      configTzTime(weatherTimezone.c_str(), "pool.ntp.org", "time.nist.gov", "time.google.com");
+      lastWeatherAttemptMs = 0;
+      packetPendingRedraw = true;
+    }
+    if (lastConnectedWifiChannel != currentChannel) {
+      Serial.printf("[wifi] channel changed %u -> %u; ESP-NOW now follows channel %u\n",
+                    lastConnectedWifiChannel, currentChannel, currentChannel);
+      lastConnectedWifiChannel = currentChannel;
+      lastPairBeaconMs = 0;
+    }
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    wifiDisconnectedSinceMs = now;
+    wifiReconnectAttempts = 0;
+    Serial.printf("[wifi] LOST status=%d; automatic recovery started\n", static_cast<int>(WiFi.status()));
+    packetPendingRedraw = true;
+  } else if (wifiDisconnectedSinceMs == 0) {
+    wifiDisconnectedSinceMs = now;
+  }
+
+  if (lastWifiReconnectAttemptMs != 0 && now - lastWifiReconnectAttemptMs < WIFI_RECONNECT_INTERVAL_MS) return;
+  lastWifiReconnectAttemptMs = now;
+  ++wifiReconnectAttempts;
+  if (wifiReconnectAttempts >= WIFI_RECONNECTS_BEFORE_RESTART) {
+    Serial.printf("[wifi] restart connection attempt=%u status=%d\n", wifiReconnectAttempts,
+                  static_cast<int>(WiFi.status()));
+    WiFi.disconnect(false, false);
+    WiFi.begin();
+    wifiReconnectAttempts = 0;
+  } else {
+    const bool queued = WiFi.reconnect();
+    Serial.printf("[wifi] reconnect attempt=%u queued=%s status=%d\n", wifiReconnectAttempts,
+                  queued ? "yes" : "no", static_cast<int>(WiFi.status()));
+  }
 }
 
 void handleTouch() {
@@ -1214,6 +1325,9 @@ void setup() {
   readLocalSensor();
 
   const bool wifiConnected = connectWifi();
+  wifiWasConnected = wifiConnected;
+  lastConnectedWifiChannel = wifiConnected ? WiFi.channel() : 0;
+  if (!wifiConnected) wifiDisconnectedSinceMs = millis();
 
   preferences.begin("drybox", true);
   goodLimitRh = preferences.getFloat("goodRh", 30.0f);
@@ -1273,6 +1387,7 @@ void loop() {
   processPendingPair();
   processPendingReadingAck();
   const uint32_t now = millis();
+  handleWifiRecovery(now);
   const uint32_t beaconInterval = pairingActive ? 500 : 1000;
   if (lastPairBeaconMs == 0 || now - lastPairBeaconMs >= beaconInterval) {
     lastPairBeaconMs = now;
