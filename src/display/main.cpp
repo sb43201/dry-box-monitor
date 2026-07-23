@@ -22,6 +22,10 @@ constexpr uint8_t TOUCH_IRQ = 36;
 constexpr uint8_t TOUCH_SCK = 14;
 constexpr uint8_t TOUCH_MISO = 12;
 constexpr uint8_t TOUCH_MOSI = 13;
+constexpr uint8_t RECEIVE_LED_PIN = 17;
+constexpr uint8_t RECEIVE_LED_ON = LOW;
+constexpr uint8_t RECEIVE_LED_OFF = HIGH;
+constexpr uint32_t RECEIVE_LED_FLASH_MS = 120;
 constexpr uint8_t SCREEN_ROTATION = 0;
 constexpr int16_t SCREEN_WIDTH = 320;
 constexpr int16_t SCREEN_HEIGHT = 480;
@@ -122,6 +126,8 @@ bool pairingActive = false;
 uint8_t selectedPairSlot = 0;
 uint32_t pairingEndsMs = 0;
 volatile bool packetPendingRedraw = false;
+volatile bool receiveLedPulsePending = false;
+uint32_t receiveLedOffAtMs = 0;
 uint8_t overviewPage = 0;
 String hostname = "drybox-monitor";
 WebServer webServer(80);
@@ -1186,6 +1192,7 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
 
   portENTER_CRITICAL(&nodeMux);
   NodeState &node = nodes[slot];
+  if (!node.received || node.packet.sequence != packet.sequence) receiveLedPulsePending = true;
   node.packet = packet;
   node.receivedMs = millis();
   node.received = true;
@@ -1299,6 +1306,8 @@ void sendPairBeacon() {
 
 void setup() {
   Serial.begin(115200);
+  pinMode(RECEIVE_LED_PIN, OUTPUT);
+  digitalWrite(RECEIVE_LED_PIN, RECEIVE_LED_OFF);
   pinMode(TFT_BACKLIGHT, OUTPUT);
   digitalWrite(TFT_BACKLIGHT, HIGH);
 
@@ -1387,6 +1396,18 @@ void loop() {
   processPendingPair();
   processPendingReadingAck();
   const uint32_t now = millis();
+  portENTER_CRITICAL(&nodeMux);
+  const bool pulseReceiveLed = receiveLedPulsePending;
+  receiveLedPulsePending = false;
+  portEXIT_CRITICAL(&nodeMux);
+  if (pulseReceiveLed) {
+    digitalWrite(RECEIVE_LED_PIN, RECEIVE_LED_ON);
+    receiveLedOffAtMs = now + RECEIVE_LED_FLASH_MS;
+  }
+  if (receiveLedOffAtMs && static_cast<int32_t>(now - receiveLedOffAtMs) >= 0) {
+    digitalWrite(RECEIVE_LED_PIN, RECEIVE_LED_OFF);
+    receiveLedOffAtMs = 0;
+  }
   handleWifiRecovery(now);
   const uint32_t beaconInterval = pairingActive ? 500 : 1000;
   if (lastPairBeaconMs == 0 || now - lastPairBeaconMs >= beaconInterval) {
