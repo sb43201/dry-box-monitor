@@ -157,7 +157,11 @@ To unpair from the touchscreen:
 2. Select the paired slot.
 3. Tap **UNPAIR**.
 
-If the node is online, the controller tells it to erase its pairing. This is the normal unpair method for Wemos nodes. If an offline node cannot receive the command, reflash it or use a separately wired recovery button if one was installed.
+If the node is online, the controller tells it to erase its pairing. This is the normal unpair method because Wemos D1 Mini ESP32 and ESP8266 boards do not provide a dedicated unpair button.
+
+For optional ESP32 recovery, start the node normally and then connect GPIO0 to GND for five seconds. Remove the connection when the serial monitor says pairing was cleared. Never ground GPIO0 while applying power or resetting the board because that can enter firmware-download mode.
+
+The ESP8266 firmware does not support the GPIO0 runtime-unpair method. If an offline ESP8266 cannot receive the controller command, erase it with `platformio run -e sensor_wemos_d1_esp8266 -t erase` and upload it again. For an ESP32 node, use `platformio run -e sensor_wemos_d1_mini32 -t erase` followed by a normal upload.
 
 ## 9. Touchscreen recalibration
 

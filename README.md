@@ -129,9 +129,23 @@ Pair one node at a time:
 4. Power up an unpaired sensor node. It scans the 2.4 GHz channels and advertises automatically.
 5. The slot changes to **Paired**. The assignment and controller MAC are saved in flash on both devices.
 
-To remove a node from the controller, select its slot and tap **Unpair**. The controller sends an unpair command to the node and clears the slot. If the node is offline and cannot receive that command, power it normally and hold its **BOOT** button for five seconds. Holding BOOT for five seconds at runtime always erases the node's saved controller and returns it to pairing mode.
+To remove a node, select its slot on the controller and tap **Unpair**. The controller sends an unpair command to the node and clears the slot. This is the normal method because Wemos D1 Mini boards do not provide a dedicated unpair button.
 
-Do not hold BOOT/FLASH while applying power because that selects firmware-download mode. Normal unpairing is available from the controller.
+The Wemos D1 Mini ESP32 firmware also supports an optional recovery input on GPIO0. Start the node normally, then connect GPIO0 to GND for five seconds and disconnect it after the serial monitor reports that pairing was cleared. Do not ground GPIO0 while powering on or resetting because that can select firmware-download mode.
+
+The ESP8266 firmware does not use GPIO0 as a runtime unpair input. If an ESP8266 node is offline and cannot receive the controller's command, erase and upload it again:
+
+```powershell
+platformio run -e sensor_wemos_d1_esp8266 -t erase
+platformio run -e sensor_wemos_d1_esp8266 -t upload
+```
+
+The same erase-and-upload recovery is available for ESP32:
+
+```powershell
+platformio run -e sensor_wemos_d1_mini32 -t erase
+platformio run -e sensor_wemos_d1_mini32 -t upload
+```
 
 ## Operation
 
