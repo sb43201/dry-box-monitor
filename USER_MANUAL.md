@@ -16,16 +16,16 @@ The wireless nodes report dry-box temperature and humidity to the controller thr
 
 Each sensor node can use a 0.91-inch 128x32 SSD1306 I2C OLED with a white display. Connect it in parallel with the AHT20:
 
-| OLED | ESP32-C3 Super Mini |
-|---|---|
-| VCC | 3.3V |
-| GND | GND |
-| SDA | GPIO3 |
-| SCL | GPIO4 |
+| OLED | Wemos D1 Mini ESP32 | Wemos D1 Mini ESP8266 |
+|---|---|---|
+| VCC | 3.3V | 3.3V |
+| GND | GND | GND |
+| SDA | GPIO21 | D2 / GPIO4 |
+| SCL | GPIO22 | D1 / GPIO5 |
 
 The expected I2C address is `0x3C`. The node detects the OLED automatically. It shows pairing status, assigned ACE number, Wi-Fi channel, temperature in °C and °F, humidity, packet number, and transmission status. The node operates normally if no OLED is connected.
 
-Each node may use either a standalone AHT20 or an AHT20/BMP280 combo module on the same GPIO3/GPIO4 I2C bus. The BMP280 is detected automatically at address `0x76` or `0x77`. A combo node adds raw BMP280 temperature and pressure to serial diagnostics and transmits pressure in the existing packet field; a standalone AHT20 node reports the BMP280 as not installed and otherwise works normally.
+Each node may use either a standalone AHT20 or an AHT20/BMP280 combo module on the same I2C bus shown above. The BMP280 is detected automatically at address `0x76` or `0x77`. A combo node adds raw BMP280 temperature and pressure to serial diagnostics and transmits pressure in the existing packet field; a standalone AHT20 node reports the BMP280 as not installed and otherwise works normally.
 
 ## 2. Controls and indicators
 
@@ -38,7 +38,7 @@ The main touchscreen shows five ACE nodes at a time. Each online node displays:
 
 The top of the main screen shows the number of online nodes and the controller's Wi-Fi IP address. Use **1-5** and **6-10** to switch node pages, **WEATHER** for weather and room conditions, and **SET** for controller settings.
 
-Tap a node card to open its detail page. The detail page shows temperature in both units, humidity, pressure when available, packet number, and reading age.
+Tap a node card to open its detail page. The detail page shows temperature in both units, humidity, pressure when available, packet number, reading age, and 24-hour temperature and humidity graphs. Graph history uses five-minute samples and resets when the controller restarts.
 
 ## 3. First startup
 
@@ -148,9 +148,7 @@ To unpair from the touchscreen:
 2. Select the paired slot.
 3. Tap **UNPAIR**.
 
-If the node is online, the controller tells it to erase its pairing. If it was offline, power it normally and hold its **BOOT** button for five seconds to clear its saved controller.
-
-Do not hold BOOT while applying power; that enters firmware-download mode. Hold it only after the node has started.
+If the node is online, the controller tells it to erase its pairing. This is the normal unpair method for Wemos nodes. If an offline node cannot receive the command, reflash it or use a separately wired recovery button if one was installed.
 
 ## 9. Touchscreen recalibration
 
