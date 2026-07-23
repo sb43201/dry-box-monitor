@@ -105,7 +105,7 @@ If the router temporarily disappears, the controller retries Wi-Fi every ten sec
 
 ## Weather page
 
-Tap **Weather** on the controller's bottom navigation bar. The page shows OpenWeather current conditions, feels-like temperature, outdoor humidity and wind, plus a four-day high/low and precipitation forecast. The controller's directly connected AHT20+BMP280 supplies the room temperature, humidity, and pressure. ACE 1 remains a normal dry-box node.
+Tap **Weather** on the controller's bottom navigation bar. The page shows OpenWeather current conditions, feels-like temperature, outdoor humidity and wind, plus a four-day high/low and precipitation forecast. The controller's directly connected AHT20+BMP280 supplies the room temperature, humidity, and pressure.
 
 Configure weather from the first-run portal or the **Weather setup** section at `http://drybox-monitor.local`:
 
