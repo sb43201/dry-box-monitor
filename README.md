@@ -81,7 +81,11 @@ Repeat that upload for each connected sensor board, up to ten nodes.
 
 ## First startup and Wi-Fi
 
-At startup the touchscreen shows a welcome page. If Wi-Fi has not been configured, use a phone or computer to:
+At every startup the touchscreen offers **USE WIFI** and **SKIP WIFI** for eight seconds. Tap **USE WIFI**, or make no selection, for normal network operation. Tap **SKIP WIFI** to run without Wi-Fi for the current boot only. Restarting the controller shows the choice again; offline mode is never saved permanently.
+
+ESP-NOW sensor monitoring, the controller's local sensor, touchscreen readings, and history graphs continue in offline mode. The web dashboard, internet weather, and network time synchronization require Wi-Fi.
+
+If Wi-Fi has not been configured and **USE WIFI** is selected, use a phone or computer to:
 
 1. Join the access point shown on the display, named `DryBoxMonitor-Setup-XXXXXX`.
 2. Open `http://192.168.4.1` if the captive portal does not open automatically.
@@ -96,6 +100,8 @@ http://drybox-monitor.local
 The controller also prints its numeric IP address to the serial monitor. The `.local` address requires mDNS support on the viewing device; if it does not resolve, use the numeric IP shown by the router or serial monitor.
 
 The local dashboard shows all ten nodes, live readings, packet age, paired/offline status, Wi-Fi channel, pairing controls, hostname configuration, and Wi-Fi reset. `/api/status` provides the same information as JSON and updates without reloading the page.
+
+If the router temporarily disappears, the controller retries Wi-Fi every ten seconds and performs a stronger saved-credential reconnect after repeated failures. When the connection returns, it restores the dashboard, `.local` service, time synchronization, and weather updates automatically. If the router selects a different 2.4 GHz channel, the controller's ESP-NOW radio follows it and its beacons allow paired nodes to scan for and save the new channel without being paired again.
 
 ## Weather page
 
@@ -131,6 +137,7 @@ Do not hold BOOT/FLASH while applying power because that selects firmware-downlo
 
 - Sensor nodes transmit immediately at startup and every 30 seconds.
 - The controller uses Wi-Fi for the local dashboard and ESP-NOW for sensors. Pairing binds each physical node MAC to one controller slot and stores the router's current radio channel in the node.
+- The controller broadcasts an ESP-NOW heartbeat approximately once per second. A paired node scans all channels after five seconds without that beacon and resumes when it finds its saved controller.
 - A node is shown offline after two minutes without a valid packet.
 - Tap a node for its detail screen.
 - Use the `1-5` and `6-10` buttons to change touchscreen pages.

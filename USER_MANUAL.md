@@ -44,7 +44,16 @@ Tap a node card to open its detail page. The detail page shows temperature in bo
 
 On first startup, follow the four touchscreen calibration targets. Tap and release each crosshair accurately. Calibration is saved automatically.
 
-If Wi-Fi is not configured, the controller creates an access point named:
+At every startup, the welcome screen shows two choices for eight seconds:
+
+- **USE WIFI:** begin normal Wi-Fi operation immediately.
+- **SKIP WIFI:** remain offline for this boot session.
+
+If no choice is made, the controller automatically uses Wi-Fi. **SKIP WIFI** is not saved; restarting or power-cycling the controller presents the choice again.
+
+Offline mode continues ESP-NOW sensor reception, the controller's local sensor, touchscreen readings, and 24-hour graphs. It disables only the web dashboard, internet weather updates, and network time synchronization. The main screen says **WiFi offline mode**.
+
+If Wi-Fi is not configured and **USE WIFI** is selected, the controller creates an access point named:
 
 `DryBoxMonitor-Setup-XXXXXX`
 
@@ -186,11 +195,25 @@ To change networks:
 
 The controller and wireless sensors must share the router's current 2.4 GHz channel for ESP-NOW operation. The paired nodes store the channel provided by the controller.
 
+### Router outage and automatic recovery
+
+If the router reboots or temporarily becomes unavailable, the controller:
+
+1. Continues local display and ESP-NOW sensor operation.
+2. Retries the saved Wi-Fi network every ten seconds.
+3. Performs a stronger connection restart after six unsuccessful retries.
+4. Restores the web dashboard, `.local` address, network time, and weather service after reconnection.
+
+The router may return on a different 2.4 GHz channel. The controller follows the router's new channel and broadcasts its channel in an ESP-NOW beacon approximately once per second. A paired node that hears no valid controller beacon for five seconds scans channels 1 through 13, finds the saved controller MAC, saves the new channel, and resumes without re-pairing.
+
+Serial messages such as `[wifi] LOST`, `[wifi] reconnect attempt`, and `[wifi] RECOVERED after 162s` show the recovery process. The elapsed value is the number of seconds between detecting the outage and confirming reconnection.
+
 ## 12. Troubleshooting
 
 ### Dashboard does not open
 
 - Confirm the controller says **WiFi** followed by an IP address.
+- If the screen says **WiFi offline mode**, restart the controller and select **USE WIFI**.
 - Browse directly to that numeric IP.
 - Confirm the phone or computer is on the same network.
 - Disable cellular data temporarily if the phone keeps leaving the local network.
@@ -212,7 +235,7 @@ The controller and wireless sensors must share the router's current 2.4 GHz chan
 
 - Confirm the node has power.
 - Wait up to 30 seconds for its next transmission.
-- Confirm the router's 2.4 GHz channel has not changed.
+- After a router channel change, allow the node time to scan channels and find the controller beacon.
 - Unpair and pair the node again if necessary.
 
 ### Local sensor error
