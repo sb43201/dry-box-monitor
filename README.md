@@ -6,34 +6,34 @@ For setup and day-to-day operation, see the [User Manual](USER_MANUAL.md).
 
 ## Hardware
 
-### Sensor nodes (up to ten identical units)
+### Sensor nodes (up to ten compatible units)
 
-- ESP32-C3 Super Mini, 4 MB flash
+- Wemos D1 Mini ESP32 or Wemos D1 Mini ESP8266, 4 MB flash
 - AHT20 breakout, or an AHT20/BMP280 combo module
 - Optional 0.91-inch 128x32 SSD1306 I2C OLED (white)
 - USB power
 
-| AHT20 | ESP32-C3 Super Mini |
-|---|---|
-| VCC | 3.3V |
-| GND | GND |
-| SDA | GPIO4 |
-| SCL | GPIO5 |
+| AHT20 | Wemos D1 Mini ESP32 | Wemos D1 Mini ESP8266 |
+|---|---|---|
+| VCC | 3.3V | 3.3V |
+| GND | GND | GND |
+| SDA | GPIO21 | D2 / GPIO4 |
+| SCL | GPIO22 | D1 / GPIO5 |
 
 The node automatically detects an optional BMP280 at address `0x76` or `0x77`. AHT20-only and AHT20/BMP280 combo nodes use the same firmware. When present, BMP280 temperature and pressure are included in serial diagnostics and pressure is sent in the existing packet field.
 
 The optional OLED shares the same I2C bus:
 
-| SSD1306 OLED | ESP32-C3 Super Mini |
-|---|---|
-| VCC | 3.3V |
-| GND | GND |
-| SDA | GPIO4 |
-| SCL | GPIO5 |
+| SSD1306 OLED | Wemos D1 Mini ESP32 | Wemos D1 Mini ESP8266 |
+|---|---|---|
+| VCC | 3.3V | 3.3V |
+| GND | GND | GND |
+| SDA | GPIO21 | D2 / GPIO4 |
+| SCL | GPIO22 | D1 / GPIO5 |
 
 The firmware automatically detects a 128x32 display at I2C address `0x3C`. No setting or separate firmware is required. The OLED shows pairing state, ACE number, radio channel, temperature in both units, humidity, and transmission status.
 
-Keep the AHT20 inside the dry box and, when practical, keep the ESP32-C3 outside. Use a short four-wire cable. Do not power the module from 5 V.
+Keep the AHT20 inside the dry box and, when practical, keep the Wemos board outside. Use a short four-wire cable. Do not power the module from 5 V.
 
 ### Central display
 
@@ -65,10 +65,16 @@ Open this folder in VS Code with PlatformIO installed. Connect the display and u
 pio run -e display -t upload
 ```
 
-For the sensor nodes, connect one ESP32-C3 at a time. Every node uses the same dynamically paired firmware:
+For a Wemos D1 Mini ESP32 sensor node:
 
 ```text
-pio run -e sensor -t upload
+pio run -e sensor_wemos_d1_mini32 -t upload
+```
+
+For a Wemos D1 Mini ESP8266 sensor node:
+
+```text
+pio run -e sensor_wemos_d1_esp8266 -t upload
 ```
 
 Repeat that upload for each connected sensor board, up to ten nodes.
@@ -105,7 +111,7 @@ Configure weather from the first-run portal or the **Weather setup** section at 
 
 Weather refreshes every 20 minutes. The touchscreen **Refresh** button requests an immediate update. A free OpenWeather API key for the Current Weather and 5 Day / 3 Hour Forecast endpoints is required.
 
-A node receives its ACE number during pairing rather than at compile time. Upload the same `sensor` environment to every physical sensor node.
+A node receives its ACE number during pairing rather than at compile time. Upload the environment matching each physical Wemos sensor board.
 
 ## Pairing and unpairing
 
@@ -119,7 +125,7 @@ Pair one node at a time:
 
 To remove a node from the controller, select its slot and tap **Unpair**. The controller sends an unpair command to the node and clears the slot. If the node is offline and cannot receive that command, power it normally and hold its **BOOT** button for five seconds. Holding BOOT for five seconds at runtime always erases the node's saved controller and returns it to pairing mode.
 
-Do not hold BOOT while applying power; on an ESP32-C3 that selects the firmware-download boot mode. Press and hold it only after the node has started.
+Do not hold BOOT/FLASH while applying power because that selects firmware-download mode. Normal unpairing is available from the controller.
 
 ## Operation
 

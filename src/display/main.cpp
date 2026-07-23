@@ -36,6 +36,9 @@ constexpr uint32_t PACKET_REDRAW_DELAY_MS = 250;
 constexpr uint8_t LOCAL_I2C_SDA = 32;
 constexpr uint8_t LOCAL_I2C_SCL = 25;
 constexpr uint32_t LOCAL_SENSOR_INTERVAL_MS = 30000;
+constexpr uint32_t HISTORY_BUCKET_MS = 5UL * 60UL * 1000UL;
+constexpr uint16_t HISTORY_BUCKETS = 24 * 60 / 5;
+constexpr uint8_t BROADCAST_ADDRESS[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 constexpr uint16_t COLOR_BG = 0x0841;
 constexpr uint16_t COLOR_PANEL = 0x10A2;
@@ -54,12 +57,27 @@ struct NodeState {
 struct PendingPairRequest {
   DryBoxProtocol::PairRequest request{};
   uint8_t sourceMac[6]{};
+  uint8_t receivedChannel = 1;
   bool pending = false;
+};
+
+struct HistorySample {
+  uint32_t bucket = 0;
+  int16_t temperatureCenti = 0;
+  uint16_t humidityCenti = 0;
+};
+
+struct NodeHistory {
+  HistorySample samples[HISTORY_BUCKETS]{};
+  uint16_t head = 0;
+  uint16_t count = 0;
+  uint32_t lastBucket = UINT32_MAX;
 };
 
 struct PendingReadingAck {
   DryBoxProtocol::ReadingAck ack{};
   uint8_t destinationMac[6]{};
+  uint32_t readyAtMs = 0;
   bool pending = false;
 };
 
@@ -78,6 +96,7 @@ SPIClass touchSpi(HSPI);
 XPT2046_Touchscreen touch(TOUCH_CS_PIN, TOUCH_IRQ);
 Preferences preferences;
 NodeState nodes[DryBoxProtocol::NODE_COUNT];
+NodeHistory nodeHistory[DryBoxProtocol::NODE_COUNT];
 uint8_t pairedMacs[DryBoxProtocol::NODE_COUNT][6]{};
 bool slotPaired[DryBoxProtocol::NODE_COUNT]{};
 uint8_t localMac[6]{};
@@ -86,6 +105,7 @@ PendingReadingAck pendingReadingAcks[DryBoxProtocol::NODE_COUNT];
 uint8_t ackQueueHead = 0;
 uint8_t ackQueueTail = 0;
 uint8_t ackQueueCount = 0;
+uint32_t lastAckQueuedMs[DryBoxProtocol::NODE_COUNT]{};
 portMUX_TYPE nodeMux = portMUX_INITIALIZER_UNLOCKED;
 float goodLimitRh = 30.0f;
 float warningLimitRh = 45.0f;
@@ -114,6 +134,7 @@ WeatherClient weatherClient;
 WeatherData weatherData;
 String weatherError;
 uint32_t lastWeatherAttemptMs = 0;
+uint32_t lastPairBeaconMs = 0;
 constexpr uint32_t WEATHER_INTERVAL_MS = 20UL * 60UL * 1000UL;
 Adafruit_AHTX0 localAht;
 Adafruit_BMP280 localBmp;
@@ -305,6 +326,91 @@ bool online(const NodeState &node, uint32_t now) {
   return node.received && now - node.receivedMs <= OFFLINE_AFTER_MS;
 }
 
+void recordHistory(uint8_t slot, const DryBoxProtocol::SensorPacket &packet, uint32_t packetTime) {
+  if (!(packet.flags & DryBoxProtocol::FLAG_SENSOR_OK) || !isfinite(packet.temperatureC) ||
+      !isfinite(packet.humidityRh)) return;
+  NodeHistory &history = nodeHistory[slot];
+  const uint32_t bucket = packetTime / HISTORY_BUCKET_MS;
+  HistorySample sample{};
+  sample.bucket = bucket;
+  sample.temperatureCenti = static_cast<int16_t>(constrain(lroundf(packet.temperatureC * 100.0f), -32768L, 32767L));
+  sample.humidityCenti = static_cast<uint16_t>(constrain(lroundf(packet.humidityRh * 100.0f), 0L, 10000L));
+  if (history.count && history.lastBucket == bucket) {
+    const uint16_t latest = (history.head + HISTORY_BUCKETS - 1) % HISTORY_BUCKETS;
+    history.samples[latest] = sample;
+    return;
+  }
+  history.samples[history.head] = sample;
+  history.head = (history.head + 1) % HISTORY_BUCKETS;
+  if (history.count < HISTORY_BUCKETS) ++history.count;
+  history.lastBucket = bucket;
+}
+
+void drawHistoryPlot(const NodeHistory &history, bool temperature, int16_t top, uint16_t color) {
+  constexpr int16_t left = 31;
+  constexpr int16_t right = 310;
+  constexpr int16_t plotHeight = 99;
+  const int16_t plotTop = top + 18;
+  const int16_t bottom = plotTop + plotHeight;
+  tft.drawRect(left, plotTop, right - left + 1, plotHeight + 1, COLOR_MUTED);
+  tft.setTextColor(color, COLOR_BG);
+  tft.drawString(temperature ? "TEMP 24H" : "HUMIDITY 24H", left, top, 2);
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
+  tft.drawString("-24h", left, bottom + 3, 1);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString("NOW", right, bottom + 3, 1);
+  tft.setTextDatum(TL_DATUM);
+  if (!history.count) {
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("COLLECTING DATA", (left + right) / 2, (plotTop + bottom) / 2, 2);
+    tft.setTextDatum(TL_DATUM);
+    return;
+  }
+
+  float minimum = 10000.0f;
+  float maximum = -10000.0f;
+  uint32_t newestBucket = 0;
+  for (uint16_t n = 0; n < history.count; ++n) {
+    const uint16_t i = (history.head + HISTORY_BUCKETS - history.count + n) % HISTORY_BUCKETS;
+    const HistorySample &sample = history.samples[i];
+    const float value = temperature ? sample.temperatureCenti / 100.0f : sample.humidityCenti / 100.0f;
+    minimum = min(minimum, value);
+    maximum = max(maximum, value);
+    newestBucket = max(newestBucket, sample.bucket);
+  }
+  float padding = max((maximum - minimum) * 0.12f, temperature ? 0.5f : 2.0f);
+  minimum -= padding;
+  maximum += padding;
+  char label[14];
+  snprintf(label, sizeof(label), temperature ? "%.1fC" : "%.0f%%", maximum);
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(label, left - 3, plotTop, 1);
+  snprintf(label, sizeof(label), temperature ? "%.1fC" : "%.0f%%", minimum);
+  tft.drawString(label, left - 3, bottom - 7, 1);
+  tft.setTextDatum(TL_DATUM);
+
+  bool havePrevious = false;
+  int16_t previousX = 0;
+  int16_t previousY = 0;
+  uint32_t previousBucket = 0;
+  for (uint16_t n = 0; n < history.count; ++n) {
+    const uint16_t i = (history.head + HISTORY_BUCKETS - history.count + n) % HISTORY_BUCKETS;
+    const HistorySample &sample = history.samples[i];
+    const uint32_t age = newestBucket - sample.bucket;
+    if (age >= HISTORY_BUCKETS) continue;
+    const int16_t x = right - static_cast<int16_t>((age * (right - left)) / (HISTORY_BUCKETS - 1));
+    const float value = temperature ? sample.temperatureCenti / 100.0f : sample.humidityCenti / 100.0f;
+    const int16_t y = bottom - static_cast<int16_t>(((value - minimum) * plotHeight) / (maximum - minimum));
+    if (havePrevious && sample.bucket - previousBucket <= 2) tft.drawLine(previousX, previousY, x, y, color);
+    tft.fillCircle(x, y, 1, color);
+    previousX = x;
+    previousY = y;
+    previousBucket = sample.bucket;
+    havePrevious = true;
+  }
+}
+
 void fillButton(int16_t x, int16_t y, int16_t w, int16_t h, const char *label, uint16_t color) {
   tft.fillRoundRect(x, y, w, h, 7, color);
   tft.drawRoundRect(x, y, w, h, 7, TFT_WHITE);
@@ -469,8 +575,10 @@ void drawWeather() {
 
 void drawDetail(uint8_t index) {
   NodeState node;
+  NodeHistory history;
   portENTER_CRITICAL(&nodeMux);
   node = nodes[index];
+  history = nodeHistory[index];
   portEXIT_CRITICAL(&nodeMux);
   const uint32_t now = millis();
 
@@ -495,23 +603,28 @@ void drawDetail(uint8_t index) {
 
   const uint16_t color = statusColor(node.packet.humidityRh);
   char value[40];
-  tft.setTextDatum(MC_DATUM);
+  tft.setTextDatum(TL_DATUM);
   tft.setTextColor(TFT_WHITE, COLOR_BG);
   const float temperatureF = node.packet.temperatureC * 9.0f / 5.0f + 32.0f;
   snprintf(value, sizeof(value), "%.1f C / %.1f F", node.packet.temperatureC, temperatureF);
-  tft.drawString(value, 160, 125, 4);
+  tft.drawString(value, 10, 61, 4);
   tft.setTextColor(color, COLOR_BG);
   snprintf(value, sizeof(value), "%.1f%% RH", node.packet.humidityRh);
-  tft.drawString(value, 160, 220, 7);
-  tft.drawString(statusText(node.packet.humidityRh), 160, 290, 4);
-  tft.setTextColor(COLOR_MUTED, COLOR_BG);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(value, 310, 64, 2);
+  tft.drawString(statusText(node.packet.humidityRh), 310, 80, 2);
+  tft.setTextDatum(TL_DATUM);
   if (node.packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK) {
-    snprintf(value, sizeof(value), "Pressure %.1f hPa", node.packet.pressureHpa);
-    tft.drawString(value, 160, 325, 2);
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    snprintf(value, sizeof(value), "%.1f hPa", node.packet.pressureHpa);
+    tft.drawString(value, 10, 87, 1);
   }
+  drawHistoryPlot(history, true, 98, COLOR_WARN);
+  drawHistoryPlot(history, false, 250, 0x07FF);
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
   snprintf(value, sizeof(value), "Packet %lu  Age %lus", static_cast<unsigned long>(node.packet.sequence),
            static_cast<unsigned long>((now - node.receivedMs) / 1000));
-  tft.drawString(value, 160, 350, 2);
+  tft.drawString(value, 31, 402, 1);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -761,6 +874,8 @@ void startWebServer() {
     overviewPage = slot / 5;
     pairingActive = true;
     pairingEndsMs = millis() + 60000;
+    Serial.printf("[pair] LISTENING from web slot=ACE %u controllerChannel=%u\n", selectedPairSlot + 1,
+                  WiFi.channel());
     webServer.send(200, "text/plain", "Pairing enabled for 60 seconds");
   });
   webServer.on("/unpair", HTTP_POST, []() {
@@ -858,6 +973,8 @@ void handleTouch() {
       } else {
         pairingActive = !pairingActive;
         pairingEndsMs = millis() + 60000;
+        Serial.printf("[pair] %s slot=ACE %u controllerChannel=%u\n", pairingActive ? "LISTENING" : "CANCELLED",
+                      selectedPairSlot + 1, WiFi.channel());
       }
     } else if (y >= 342 && y < 412 && x >= 160) {
       pairingActive = false;
@@ -922,10 +1039,18 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
   if (length == sizeof(DryBoxProtocol::PairRequest)) {
     DryBoxProtocol::PairRequest request;
     memcpy(&request, data, sizeof(request));
-    if (!pairingActive || slotPaired[selectedPairSlot] || !DryBoxProtocol::valid(request)) return;
+    if (!pairingActive || !DryBoxProtocol::valid(request)) return;
+    if (slotPaired[selectedPairSlot] && memcmp(sourceMac, pairedMacs[selectedPairSlot], 6) != 0) return;
+    uint8_t actualChannel = 1;
+    wifi_second_chan_t secondaryChannel = WIFI_SECOND_CHAN_NONE;
+    esp_wifi_get_channel(&actualChannel, &secondaryChannel);
+    Serial.printf("[pair] request mac=%02X:%02X:%02X:%02X:%02X:%02X slot=ACE %u channel=%u nonce=%lu\n",
+                  sourceMac[0], sourceMac[1], sourceMac[2], sourceMac[3], sourceMac[4], sourceMac[5],
+                  selectedPairSlot + 1, actualChannel, static_cast<unsigned long>(request.nonce));
     portENTER_CRITICAL(&nodeMux);
     pendingPair.request = request;
     memcpy(pendingPair.sourceMac, sourceMac, 6);
+    pendingPair.receivedChannel = actualChannel;
     pendingPair.pending = true;
     portEXIT_CRITICAL(&nodeMux);
     return;
@@ -937,6 +1062,10 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
 
   const uint8_t slot = packet.nodeId - 1;
   if (!slotPaired[slot] || memcmp(sourceMac, pairedMacs[slot], 6) != 0) return;
+  if (pairingActive && slot == selectedPairSlot) {
+    pairingActive = false;
+    Serial.printf("[pair] ACE %u confirmed by first sensor packet\n", slot + 1);
+  }
 
   const float packetTemperatureF = packet.temperatureC * 9.0f / 5.0f + 32.0f;
   Serial.printf("[receive] mac=%02X:%02X:%02X:%02X:%02X:%02X node=%u seq=%lu temp=%.2fC/%.2fF humidity=%.2f%% pressure=%.2fhPa flags=0x%02X\n",
@@ -951,7 +1080,9 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
   node.received = true;
   ++validPacketCount;
   packetPendingRedraw = true;
-  if (ackQueueCount < DryBoxProtocol::NODE_COUNT) {
+  const uint32_t packetTime = millis();
+  recordHistory(slot, packet, packetTime);
+  if (packetTime - lastAckQueuedMs[slot] >= 500 && ackQueueCount < DryBoxProtocol::NODE_COUNT) {
     PendingReadingAck &queued = pendingReadingAcks[ackQueueTail];
     queued.ack = DryBoxProtocol::ReadingAck{};
     queued.ack.magic = DryBoxProtocol::READING_ACK_MAGIC;
@@ -961,23 +1092,30 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
     queued.ack.sequence = packet.sequence;
     queued.ack.checksum = DryBoxProtocol::messageChecksum(queued.ack);
     memcpy(queued.destinationMac, sourceMac, 6);
+    queued.readyAtMs = packetTime + 250;
     queued.pending = true;
     ackQueueTail = (ackQueueTail + 1) % DryBoxProtocol::NODE_COUNT;
     ++ackQueueCount;
+    lastAckQueuedMs[slot] = packetTime;
   }
   portEXIT_CRITICAL(&nodeMux);
 }
 
 void onSent(const uint8_t *destinationMac, esp_now_send_status_t status) {
-  Serial.printf("[radio] frame to %02X:%02X:%02X:%02X:%02X:%02X delivery=%s\n", destinationMac[0],
-                destinationMac[1], destinationMac[2], destinationMac[3], destinationMac[4], destinationMac[5],
-                status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAILED");
+  if (status != ESP_NOW_SEND_SUCCESS) {
+    Serial.printf("[radio] frame to %02X:%02X:%02X:%02X:%02X:%02X delivery=FAILED\n", destinationMac[0],
+                  destinationMac[1], destinationMac[2], destinationMac[3], destinationMac[4], destinationMac[5]);
+  }
 }
 
 void processPendingReadingAck() {
   PendingReadingAck pending;
   portENTER_CRITICAL(&nodeMux);
   if (ackQueueCount == 0) {
+    portEXIT_CRITICAL(&nodeMux);
+    return;
+  }
+  if (static_cast<int32_t>(millis() - pendingReadingAcks[ackQueueHead].readyAtMs) < 0) {
     portEXIT_CRITICAL(&nodeMux);
     return;
   }
@@ -1003,28 +1141,48 @@ void processPendingPair() {
   pendingPair.pending = false;
   portEXIT_CRITICAL(&nodeMux);
 
-  if (!pairingActive || slotPaired[selectedPairSlot]) return;
-  memcpy(pairedMacs[selectedPairSlot], request.sourceMac, 6);
+  if (!pairingActive) return;
+  if (slotPaired[selectedPairSlot] && memcmp(request.sourceMac, pairedMacs[selectedPairSlot], 6) != 0) return;
+  const bool newNode = !slotPaired[selectedPairSlot];
+  if (newNode) memcpy(pairedMacs[selectedPairSlot], request.sourceMac, 6);
   slotPaired[selectedPairSlot] = true;
   addPeer(request.sourceMac);
-  savePairedSlot(selectedPairSlot);
+  if (newNode) savePairedSlot(selectedPairSlot);
 
   DryBoxProtocol::PairResponse response{};
   response.magic = DryBoxProtocol::PAIR_RESPONSE_MAGIC;
   response.version = DryBoxProtocol::VERSION;
   response.assignedNodeId = selectedPairSlot + 1;
-  response.wifiChannel = WiFi.channel();
+  response.wifiChannel = request.receivedChannel;
   memcpy(response.controllerMac, localMac, 6);
   response.nonce = request.request.nonce;
   response.checksum = DryBoxProtocol::messageChecksum(response);
-  // Repeat the short response to make first-time pairing resilient to a lost radio frame.
-  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
-    esp_now_send(request.sourceMac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
-    delay(30);
+  // Keep pairing active until the node confirms with its first reading. Duplicate requests resend this response.
+  for (uint8_t attempt = 0; attempt < 5; ++attempt) {
+    const esp_err_t result = esp_now_send(request.sourceMac, reinterpret_cast<const uint8_t *>(&response), sizeof(response));
+    Serial.printf("[pair] response attempt=%u slot=ACE %u queue=%s\n", attempt + 1, selectedPairSlot + 1,
+                  result == ESP_OK ? "OK" : "FAILED");
+    delay(50);
   }
-  pairingActive = false;
   packetPendingRedraw = true;
   redraw();
+}
+
+void sendPairBeacon() {
+  DryBoxProtocol::PairBeacon beacon{};
+  beacon.magic = DryBoxProtocol::PAIR_BEACON_MAGIC;
+  beacon.version = DryBoxProtocol::VERSION;
+  beacon.assignedNodeId = selectedPairSlot + 1;
+  beacon.reserved = pairingActive ? 1 : 0;
+  wifi_second_chan_t secondaryChannel = WIFI_SECOND_CHAN_NONE;
+  esp_wifi_get_channel(&beacon.wifiChannel, &secondaryChannel);
+  memcpy(beacon.controllerMac, localMac, sizeof(localMac));
+  beacon.checksum = DryBoxProtocol::messageChecksum(beacon);
+  const esp_err_t result = esp_now_send(BROADCAST_ADDRESS, reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
+  if (pairingActive) {
+    Serial.printf("[pair] beacon slot=ACE %u channel=%u send=%d\n", selectedPairSlot + 1, beacon.wifiChannel,
+                  static_cast<int>(result));
+  }
 }
 }  // namespace
 
@@ -1063,7 +1221,7 @@ void setup() {
   for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
     char key[8];
     snprintf(key, sizeof(key), "mac%u", i + 1);
-    if (preferences.getBytesLength(key) == 6) {
+    if (preferences.isKey(key) && preferences.getBytesLength(key) == 6) {
       preferences.getBytes(key, pairedMacs[i], 6);
       slotPaired[i] = true;
     }
@@ -1073,8 +1231,13 @@ void setup() {
   if (warningLimitRh <= goodLimitRh || warningLimitRh > 80) warningLimitRh = 45;
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  const esp_err_t protocolResult = esp_wifi_set_protocol(
+      WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
   WiFi.macAddress(localMac);
   Serial.printf("[radio] Display MAC %s\n", WiFi.macAddress().c_str());
+  Serial.printf("[radio] maxTxPower=19.5dBm standardWiFi=%s\n", protocolResult == ESP_OK ? "enabled" : "failed");
   if (esp_now_init() != ESP_OK) {
     tft.setTextColor(TFT_RED, COLOR_BG);
     tft.drawString("ESP-NOW FAILED", 20, 100, 4);
@@ -1083,6 +1246,7 @@ void setup() {
   }
   esp_now_register_recv_cb(onPacket);
   esp_now_register_send_cb(onSent);
+  addPeer(BROADCAST_ADDRESS);
   for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
     if (slotPaired[i]) addPeer(pairedMacs[i]);
   }
@@ -1109,6 +1273,11 @@ void loop() {
   processPendingPair();
   processPendingReadingAck();
   const uint32_t now = millis();
+  const uint32_t beaconInterval = pairingActive ? 500 : 1000;
+  if (lastPairBeaconMs == 0 || now - lastPairBeaconMs >= beaconInterval) {
+    lastPairBeaconMs = now;
+    sendPairBeacon();
+  }
   if (now - lastLocalSensorMs >= LOCAL_SENSOR_INTERVAL_MS) {
     readLocalSensor();
     if (weatherScreen) redraw();
