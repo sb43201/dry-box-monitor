@@ -2,6 +2,7 @@
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_BMP280.h>
 #include <Preferences.h>
+#include <SD.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WebServer.h>
@@ -15,13 +16,26 @@
 #include "protocol.h"
 #include "weather.h"
 
+#ifndef DRYBOX_FIRMWARE_VERSION
+#define DRYBOX_FIRMWARE_VERSION "unknown"
+#endif
+#ifndef DRYBOX_GIT_COMMIT
+#define DRYBOX_GIT_COMMIT "unknown"
+#endif
+
 namespace {
+constexpr const char *FIRMWARE_VERSION = DRYBOX_FIRMWARE_VERSION;
+constexpr const char *GIT_COMMIT = DRYBOX_GIT_COMMIT;
 constexpr uint8_t TFT_BACKLIGHT = 27;
 constexpr uint8_t TOUCH_CS_PIN = 33;
 constexpr uint8_t TOUCH_IRQ = 36;
 constexpr uint8_t TOUCH_SCK = 14;
 constexpr uint8_t TOUCH_MISO = 12;
 constexpr uint8_t TOUCH_MOSI = 13;
+constexpr uint8_t SD_CS_PIN = 5;
+constexpr uint8_t SD_SCK_PIN = 18;
+constexpr uint8_t SD_MISO_PIN = 19;
+constexpr uint8_t SD_MOSI_PIN = 23;
 constexpr uint8_t RECEIVE_LED_PIN = 17;
 constexpr uint8_t RECEIVE_LED_ON = LOW;
 constexpr uint8_t RECEIVE_LED_OFF = HIGH;
@@ -45,6 +59,15 @@ constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
 constexpr uint8_t WIFI_RECONNECTS_BEFORE_RESTART = 6;
 constexpr uint32_t HISTORY_BUCKET_MS = 5UL * 60UL * 1000UL;
 constexpr uint16_t HISTORY_BUCKETS = 24 * 60 / 5;
+constexpr uint32_t SD_LOG_FLUSH_MS = 30000;
+constexpr uint32_t SD_HISTORY_SAVE_MS = 5UL * 60UL * 1000UL;
+constexpr uint32_t SD_RETRY_MS = 60000;
+constexpr uint32_t SD_SPACE_CHECK_MS = 60000;
+constexpr uint32_t SD_CLEANUP_INTERVAL_MS = 1000;
+constexpr uint64_t SD_LOW_FREE_BYTES = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr uint64_t SD_CLEANUP_TARGET_BYTES = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr uint32_t HISTORY_FILE_MAGIC = 0x48424441;
+constexpr uint16_t HISTORY_FILE_VERSION = 1;
 constexpr uint8_t BROADCAST_ADDRESS[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 constexpr uint16_t COLOR_BG = 0x0841;
@@ -88,6 +111,20 @@ struct PendingReadingAck {
   bool pending = false;
 };
 
+struct PendingSdPacket {
+  DryBoxProtocol::SensorPacket packet{};
+  uint32_t receivedMs = 0;
+  bool pending = false;
+};
+
+struct HistoryFileHeader {
+  uint32_t magic = HISTORY_FILE_MAGIC;
+  uint16_t version = HISTORY_FILE_VERSION;
+  uint16_t nodeCount = DryBoxProtocol::NODE_COUNT;
+  uint16_t bucketCount = HISTORY_BUCKETS;
+  uint16_t reserved = 0;
+};
+
 struct LocalSensorReading {
   float rawTemperatureC = NAN;
   float temperatureC = NAN;
@@ -99,16 +136,18 @@ struct LocalSensorReading {
 };
 
 TFT_eSPI tft;
-SPIClass touchSpi(HSPI);
+SPIClass sdSpi(VSPI);
 XPT2046_Touchscreen touch(TOUCH_CS_PIN, TOUCH_IRQ);
 Preferences preferences;
 NodeState nodes[DryBoxProtocol::NODE_COUNT];
 NodeHistory nodeHistory[DryBoxProtocol::NODE_COUNT];
+NodeHistory sdHistoryBuffer[DryBoxProtocol::NODE_COUNT];
 uint8_t pairedMacs[DryBoxProtocol::NODE_COUNT][6]{};
 bool slotPaired[DryBoxProtocol::NODE_COUNT]{};
 uint8_t localMac[6]{};
 PendingPairRequest pendingPair;
 PendingReadingAck pendingReadingAcks[DryBoxProtocol::NODE_COUNT];
+PendingSdPacket pendingSdPackets[DryBoxProtocol::NODE_COUNT];
 uint8_t ackQueueHead = 0;
 uint8_t ackQueueTail = 0;
 uint8_t ackQueueCount = 0;
@@ -150,6 +189,22 @@ uint8_t wifiReconnectAttempts = 0;
 uint8_t lastConnectedWifiChannel = 0;
 bool wifiWasConnected = false;
 bool wifiSkippedAtStartup = false;
+bool sdBusStarted = false;
+bool sdReady = false;
+bool sdHistoryDirty = false;
+bool sdCleanupActive = false;
+bool sdStorageFull = false;
+uint64_t sdTotalBytes = 0;
+uint64_t sdFreeBytes = 0;
+uint32_t sdDeletedLogCount = 0;
+uint32_t historyBootBucketBase = 0;
+uint32_t lastSdAttemptMs = 0;
+uint32_t lastSdLogFlushMs = 0;
+uint32_t lastSdHistorySaveMs = 0;
+uint32_t lastSdSpaceCheckMs = 0;
+uint32_t lastSdCleanupMs = 0;
+String sdLogBuffer;
+String sdLogPath;
 constexpr uint32_t WEATHER_INTERVAL_MS = 20UL * 60UL * 1000UL;
 Adafruit_AHTX0 localAht;
 Adafruit_BMP280 localBmp;
@@ -348,11 +403,10 @@ bool online(const NodeState &node, uint32_t now) {
   return node.received && now - node.receivedMs <= OFFLINE_AFTER_MS;
 }
 
-void recordHistory(uint8_t slot, const DryBoxProtocol::SensorPacket &packet, uint32_t packetTime) {
+void recordHistory(uint8_t slot, const DryBoxProtocol::SensorPacket &packet, uint32_t bucket) {
   if (!(packet.flags & DryBoxProtocol::FLAG_SENSOR_OK) || !isfinite(packet.temperatureC) ||
       !isfinite(packet.humidityRh)) return;
   NodeHistory &history = nodeHistory[slot];
-  const uint32_t bucket = packetTime / HISTORY_BUCKET_MS;
   HistorySample sample{};
   sample.bucket = bucket;
   sample.temperatureCenti = static_cast<int16_t>(constrain(lroundf(packet.temperatureC * 100.0f), -32768L, 32767L));
@@ -366,6 +420,274 @@ void recordHistory(uint8_t slot, const DryBoxProtocol::SensorPacket &packet, uin
   history.head = (history.head + 1) % HISTORY_BUCKETS;
   if (history.count < HISTORY_BUCKETS) ++history.count;
   history.lastBucket = bucket;
+}
+
+bool clockIsSynchronized() {
+  return time(nullptr) >= 1700000000;
+}
+
+uint32_t historyBucketNow() {
+  const uint32_t fallbackBucket = historyBootBucketBase + millis() / HISTORY_BUCKET_MS;
+  if (!clockIsSynchronized()) return fallbackBucket;
+  const uint32_t clockBucket = static_cast<uint32_t>(time(nullptr) / (HISTORY_BUCKET_MS / 1000UL));
+  return max(clockBucket, fallbackBucket);
+}
+
+String sdStatusText() {
+  if (!sdReady) return "SD CARD: MISSING";
+  if (sdStorageFull) return "SD CARD: FULL";
+  if (sdCleanupActive) return "SD: CLEANING OLD LOGS";
+  if (sdFreeBytes < SD_LOW_FREE_BYTES) return "SD CARD: LOW SPACE";
+  const float freeGb = sdFreeBytes / (1024.0f * 1024.0f * 1024.0f);
+  return "SD: " + String(freeGb, 1) + " GB FREE";
+}
+
+void refreshSdSpace() {
+  if (!sdReady) {
+    sdTotalBytes = 0;
+    sdFreeBytes = 0;
+    sdStorageFull = false;
+    sdCleanupActive = false;
+    return;
+  }
+  sdTotalBytes = SD.totalBytes();
+  const uint64_t usedBytes = SD.usedBytes();
+  sdFreeBytes = usedBytes <= sdTotalBytes ? sdTotalBytes - usedBytes : 0;
+  sdStorageFull = sdFreeBytes < 1024ULL * 1024ULL;
+  if (sdFreeBytes < SD_LOW_FREE_BYTES) sdCleanupActive = true;
+  if (sdFreeBytes >= SD_CLEANUP_TARGET_BYTES) sdCleanupActive = false;
+  lastSdSpaceCheckMs = millis();
+}
+
+bool datedLogPath(const String &name, String &path) {
+  String base = name;
+  const int slash = base.lastIndexOf('/');
+  if (slash >= 0) base = base.substring(slash + 1);
+  if (base.length() != 14 || base.charAt(4) != '-' || base.charAt(7) != '-' || !base.endsWith(".csv")) return false;
+  for (uint8_t i = 0; i < 10; ++i) {
+    if (i == 4 || i == 7) continue;
+    if (!isDigit(base.charAt(i))) return false;
+  }
+  path = "/logs/" + base;
+  return true;
+}
+
+bool deleteOldestDatedLog() {
+  if (!sdReady) return false;
+  File directory = SD.open("/logs");
+  if (!directory || !directory.isDirectory()) {
+    if (directory) directory.close();
+    return false;
+  }
+  String oldestPath;
+  File entry = directory.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String candidate;
+      if (datedLogPath(entry.name(), candidate) && candidate != sdLogPath &&
+          (!oldestPath.length() || candidate < oldestPath)) {
+        oldestPath = candidate;
+      }
+    }
+    entry.close();
+    entry = directory.openNextFile();
+  }
+  directory.close();
+  if (!oldestPath.length()) {
+    Serial.println("[sd] storage low but no completed dated CSV logs can be deleted");
+    return false;
+  }
+  if (!SD.remove(oldestPath)) {
+    Serial.printf("[sd] failed to delete oldest log path=%s\n", oldestPath.c_str());
+    return false;
+  }
+  ++sdDeletedLogCount;
+  Serial.printf("[sd] deleted oldest log path=%s cleanupCount=%lu\n", oldestPath.c_str(),
+                static_cast<unsigned long>(sdDeletedLogCount));
+  refreshSdSpace();
+  return true;
+}
+
+bool flushSdLogBuffer() {
+  if (!sdReady || !sdLogBuffer.length() || !sdLogPath.length()) return false;
+  const bool newFile = !SD.exists(sdLogPath);
+  File file = SD.open(sdLogPath, FILE_APPEND);
+  if (!file) {
+    Serial.printf("[sd] log open failed path=%s\n", sdLogPath.c_str());
+    sdReady = false;
+    return false;
+  }
+  if (newFile) {
+    file.println("date,time_or_uptime,node,sequence,temp_c,temp_f,humidity_rh,pressure_hpa,flags");
+  }
+  const size_t expected = sdLogBuffer.length();
+  const size_t written = file.print(sdLogBuffer);
+  file.flush();
+  file.close();
+  if (written != expected) {
+    Serial.printf("[sd] short log write path=%s written=%u expected=%u\n", sdLogPath.c_str(),
+                  static_cast<unsigned>(written), static_cast<unsigned>(expected));
+    sdReady = false;
+    return false;
+  }
+  Serial.printf("[sd] log flushed path=%s bytes=%u\n", sdLogPath.c_str(), static_cast<unsigned>(written));
+  sdLogBuffer = "";
+  lastSdLogFlushMs = millis();
+  refreshSdSpace();
+  return true;
+}
+
+void queueSdLogRow(const DryBoxProtocol::SensorPacket &packet, uint32_t receivedMs) {
+  if (!sdReady) return;
+  String path;
+  char date[16] = "UNSYNCED";
+  char timeValue[20];
+  if (clockIsSynchronized()) {
+    time_t now = time(nullptr);
+    struct tm localTime {};
+    localtime_r(&now, &localTime);
+    strftime(date, sizeof(date), "%Y-%m-%d", &localTime);
+    strftime(timeValue, sizeof(timeValue), "%H:%M:%S", &localTime);
+    path = "/logs/" + String(date) + ".csv";
+  } else {
+    snprintf(timeValue, sizeof(timeValue), "%lus", static_cast<unsigned long>(receivedMs / 1000UL));
+    path = "/logs/unsynced.csv";
+  }
+  if (sdLogBuffer.length() && sdLogPath != path && !flushSdLogBuffer()) return;
+  sdLogPath = path;
+  char row[192];
+  const float temperatureF = packet.temperatureC * 9.0f / 5.0f + 32.0f;
+  snprintf(row, sizeof(row), "%s,%s,%u,%lu,%.2f,%.2f,%.2f,%.2f,0x%02X\n", date, timeValue, packet.nodeId,
+           static_cast<unsigned long>(packet.sequence), packet.temperatureC, temperatureF, packet.humidityRh,
+           packet.pressureHpa, packet.flags);
+  sdLogBuffer += row;
+  if (sdLogBuffer.length() >= 2048) flushSdLogBuffer();
+}
+
+bool saveHistoryToSd() {
+  if (!sdReady) return false;
+  if (SD.exists("/history.tmp")) SD.remove("/history.tmp");
+  File file = SD.open("/history.tmp", FILE_WRITE);
+  if (!file) {
+    Serial.println("[sd] history temporary file open failed");
+    sdReady = false;
+    return false;
+  }
+  const HistoryFileHeader header;
+  portENTER_CRITICAL(&nodeMux);
+  memcpy(sdHistoryBuffer, nodeHistory, sizeof(sdHistoryBuffer));
+  portEXIT_CRITICAL(&nodeMux);
+  const size_t headerWritten = file.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+  const size_t historyWritten = file.write(reinterpret_cast<const uint8_t *>(sdHistoryBuffer), sizeof(sdHistoryBuffer));
+  file.flush();
+  file.close();
+  if (headerWritten != sizeof(header) || historyWritten != sizeof(sdHistoryBuffer)) {
+    if (SD.exists("/history.tmp")) SD.remove("/history.tmp");
+    Serial.println("[sd] history write incomplete");
+    sdReady = false;
+    return false;
+  }
+  if (SD.exists("/history.bin")) SD.remove("/history.bin");
+  if (!SD.rename("/history.tmp", "/history.bin")) {
+    Serial.println("[sd] history rename failed");
+    sdReady = false;
+    return false;
+  }
+  sdHistoryDirty = false;
+  lastSdHistorySaveMs = millis();
+  Serial.printf("[sd] 24-hour history saved bytes=%u\n",
+                static_cast<unsigned>(sizeof(header) + sizeof(sdHistoryBuffer)));
+  refreshSdSpace();
+  return true;
+}
+
+bool loadHistoryFromSd() {
+  if (!sdReady || !SD.exists("/history.bin")) {
+    Serial.println("[sd] no saved history; starting empty");
+    return false;
+  }
+  File file = SD.open("/history.bin", FILE_READ);
+  if (!file) return false;
+  HistoryFileHeader header;
+  const size_t headerRead = file.read(reinterpret_cast<uint8_t *>(&header), sizeof(header));
+  const size_t historyRead = file.read(reinterpret_cast<uint8_t *>(sdHistoryBuffer), sizeof(sdHistoryBuffer));
+  file.close();
+  if (headerRead != sizeof(header) || historyRead != sizeof(sdHistoryBuffer) || header.magic != HISTORY_FILE_MAGIC ||
+      header.version != HISTORY_FILE_VERSION || header.nodeCount != DryBoxProtocol::NODE_COUNT ||
+      header.bucketCount != HISTORY_BUCKETS) {
+    Serial.println("[sd] saved history is invalid or incompatible");
+    return false;
+  }
+  uint32_t newestBucket = 0;
+  for (uint8_t slot = 0; slot < DryBoxProtocol::NODE_COUNT; ++slot) {
+    if (sdHistoryBuffer[slot].head >= HISTORY_BUCKETS || sdHistoryBuffer[slot].count > HISTORY_BUCKETS) {
+      Serial.printf("[sd] saved history slot=%u is invalid\n", slot + 1);
+      return false;
+    }
+    newestBucket = max(newestBucket, sdHistoryBuffer[slot].lastBucket);
+  }
+  portENTER_CRITICAL(&nodeMux);
+  memcpy(nodeHistory, sdHistoryBuffer, sizeof(sdHistoryBuffer));
+  portEXIT_CRITICAL(&nodeMux);
+  historyBootBucketBase = newestBucket ? newestBucket + 1 : 0;
+  Serial.printf("[sd] restored 24-hour history newestBucket=%lu\n", static_cast<unsigned long>(newestBucket));
+  return true;
+}
+
+bool initializeSdCard(bool restoreHistory) {
+  lastSdAttemptMs = millis();
+  if (!sdBusStarted) {
+    sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    sdBusStarted = true;
+  }
+  SD.end();
+  sdReady = SD.begin(SD_CS_PIN, sdSpi, 10000000) && SD.cardType() != CARD_NONE;
+  if (!sdReady) {
+    Serial.println("[sd] card not detected; RAM-only history active");
+    return false;
+  }
+  SD.mkdir("/logs");
+  sdLogBuffer.reserve(2048);
+  refreshSdSpace();
+  Serial.printf("[sd] ready size=%lluMB free=%lluMB\n",
+                static_cast<unsigned long long>(sdTotalBytes / (1024ULL * 1024ULL)),
+                static_cast<unsigned long long>(sdFreeBytes / (1024ULL * 1024ULL)));
+  if (restoreHistory) loadHistoryFromSd();
+  return true;
+}
+
+void processPendingHistoryAndLogs() {
+  for (uint8_t slot = 0; slot < DryBoxProtocol::NODE_COUNT; ++slot) {
+    PendingSdPacket pending;
+    portENTER_CRITICAL(&nodeMux);
+    pending = pendingSdPackets[slot];
+    pendingSdPackets[slot].pending = false;
+    portEXIT_CRITICAL(&nodeMux);
+    if (!pending.pending) continue;
+    const uint32_t bucket = historyBucketNow();
+    portENTER_CRITICAL(&nodeMux);
+    recordHistory(slot, pending.packet, bucket);
+    portEXIT_CRITICAL(&nodeMux);
+    sdHistoryDirty = true;
+    queueSdLogRow(pending.packet, pending.receivedMs);
+  }
+}
+
+void maintainSdStorage(uint32_t now) {
+  if (!sdReady) {
+    if (now - lastSdAttemptMs >= SD_RETRY_MS) initializeSdCard(false);
+    return;
+  }
+  if (sdLogBuffer.length() && now - lastSdLogFlushMs >= SD_LOG_FLUSH_MS) flushSdLogBuffer();
+  if (sdHistoryDirty &&
+      (lastSdHistorySaveMs == 0 || now - lastSdHistorySaveMs >= SD_HISTORY_SAVE_MS)) {
+    saveHistoryToSd();
+  }
+  if (now - lastSdSpaceCheckMs >= SD_SPACE_CHECK_MS) refreshSdSpace();
+  if (sdCleanupActive && now - lastSdCleanupMs >= SD_CLEANUP_INTERVAL_MS) {
+    lastSdCleanupMs = now;
+    if (!deleteOldestDatedLog()) sdCleanupActive = false;
+  }
 }
 
 void drawHistoryPlot(const NodeHistory &history, bool temperature, int16_t top, uint16_t color) {
@@ -673,6 +995,11 @@ void drawSettings() {
   fillButton(256, 130, 54, 48, "+", 0x3186);
   fillButton(10, 242, 54, 48, "-", 0x3186);
   fillButton(256, 242, 54, 48, "+", 0x3186);
+  tft.setTextColor(sdReady ? COLOR_GOOD : COLOR_WARN, COLOR_BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("FW " + String(FIRMWARE_VERSION) + "  " + GIT_COMMIT, SCREEN_WIDTH / 2, 300, 1);
+  tft.drawString(sdStatusText(), SCREEN_WIDTH / 2, 316, 2);
+  tft.setTextDatum(TL_DATUM);
   fillButton(8, 332, 148, 56, "PAIR NODES", 0x3186);
   fillButton(164, 332, 148, 56, "CAL TOUCH", 0x3186);
   fillButton(8, 420, 304, 50, "SAVE & BACK", 0x04A8);
@@ -864,8 +1191,15 @@ void sendJsonStatus() {
   const uint32_t now = millis();
   String json;
   json.reserve(1800);
-  json = "{\"hostname\":\"" + hostname + "\",\"ip\":\"" + WiFi.localIP().toString() +
-         "\",\"channel\":" + String(WiFi.channel()) + ",\"goodLimitRh\":" + String(goodLimitRh, 0) +
+  json = "{\"hostname\":\"" + hostname + "\",\"firmwareVersion\":\"" + FIRMWARE_VERSION +
+         "\",\"gitCommit\":\"" + GIT_COMMIT + "\",\"ip\":\"" + WiFi.localIP().toString() +
+         "\",\"channel\":" + String(WiFi.channel()) + ",\"sdReady\":" + String(sdReady ? "true" : "false") +
+         ",\"sdFreeMB\":" + String(static_cast<unsigned long long>(sdFreeBytes / (1024ULL * 1024ULL))) +
+         ",\"sdTotalMB\":" + String(static_cast<unsigned long long>(sdTotalBytes / (1024ULL * 1024ULL))) +
+         ",\"sdCleanupActive\":" + String(sdCleanupActive ? "true" : "false") +
+         ",\"sdStorageFull\":" + String(sdStorageFull ? "true" : "false") +
+         ",\"sdDeletedLogs\":" + String(sdDeletedLogCount) +
+         ",\"goodLimitRh\":" + String(goodLimitRh, 0) +
          ",\"warningLimitRh\":" + String(warningLimitRh, 0) + ",\"nodes\":[";
   for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
     if (i) json += ',';
@@ -907,10 +1241,15 @@ body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margi
           String(weatherImperial ? " checked" : "") + "> Fahrenheit / mph</label><br><button>Save weather</button></form></div>";
   page += F(R"HTML(<div class=panel><h2>Controller</h2><form method=post action=/hostname><label>Hostname </label><input name=host maxlength=32 pattern="[a-zA-Z0-9-]+" value=")HTML");
   page += hostname;
-  page += F(R"HTML("><button>Save and restart</button></form><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
+  page += F(R"HTML("><button>Save and restart</button></form><p class=meta>Firmware )HTML");
+  page += FIRMWARE_VERSION;
+  page += " &nbsp; Git ";
+  page += GIT_COMMIT;
+  page += F(R"HTML(</p><p class=meta id=storage>Loading storage...</p><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
 <script>
 async function post(url){await fetch(url,{method:'POST'});setTimeout(load,300)}
-async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel;
+async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel+'  |  FW '+d.firmwareVersion+' ('+d.gitCommit+')';
+storage.textContent=!d.sdReady?'SD card missing':d.sdStorageFull?'SD card full':d.sdCleanupActive?'SD cleanup active — '+(d.sdFreeMB/1024).toFixed(1)+' GB free':'SD card — '+(d.sdFreeMB/1024).toFixed(1)+' GB free of '+(d.sdTotalMB/1024).toFixed(1)+' GB; '+d.sdDeletedLogs+' old logs deleted';
 nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?(n.online?'SENSOR ERROR':'OFFLINE'):'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
 pairButtons.innerHTML=d.nodes.filter(n=>!n.paired).map(n=>`<button onclick="post('/pair?slot=${n.id}')">Pair ${n.name}</button>`).join('')||'All slots are paired.';}catch(e){connection.textContent='Controller unavailable';}}load();setInterval(load,3000);
 </script></body></html>)HTML");
@@ -1176,6 +1515,7 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
   DryBoxProtocol::SensorPacket packet;
   memcpy(&packet, data, sizeof(packet));
   if (!DryBoxProtocol::valid(packet)) return;
+  if (packet.nodeId < 1 || packet.nodeId > DryBoxProtocol::NODE_COUNT) return;
 
   const uint8_t slot = packet.nodeId - 1;
   if (!slotPaired[slot] || memcmp(sourceMac, pairedMacs[slot], 6) != 0) return;
@@ -1192,14 +1532,19 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
 
   portENTER_CRITICAL(&nodeMux);
   NodeState &node = nodes[slot];
-  if (!node.received || node.packet.sequence != packet.sequence) receiveLedPulsePending = true;
+  const bool newSequence = !node.received || node.packet.sequence != packet.sequence;
+  if (newSequence) {
+    receiveLedPulsePending = true;
+    pendingSdPackets[slot].packet = packet;
+    pendingSdPackets[slot].receivedMs = millis();
+    pendingSdPackets[slot].pending = true;
+  }
   node.packet = packet;
   node.receivedMs = millis();
   node.received = true;
   ++validPacketCount;
   packetPendingRedraw = true;
   const uint32_t packetTime = millis();
-  recordHistory(slot, packet, packetTime);
   if (packetTime - lastAckQueuedMs[slot] >= 500 && ackQueueCount < DryBoxProtocol::NODE_COUNT) {
     PendingReadingAck &queued = pendingReadingAcks[ackQueueTail];
     queued.ack = DryBoxProtocol::ReadingAck{};
@@ -1306,6 +1651,7 @@ void sendPairBeacon() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.printf("\n[firmware] version=%s commit=%s built=%s %s\n", FIRMWARE_VERSION, GIT_COMMIT, __DATE__, __TIME__);
   pinMode(RECEIVE_LED_PIN, OUTPUT);
   digitalWrite(RECEIVE_LED_PIN, RECEIVE_LED_OFF);
   pinMode(TFT_BACKLIGHT, OUTPUT);
@@ -1316,9 +1662,9 @@ void setup() {
   tft.fillScreen(COLOR_BG);
   tft.setTextWrap(false);
 
-  touchSpi.begin(TOUCH_SCK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS_PIN);
-  touch.begin(touchSpi);
+  touch.begin(TFT_eSPI::getSPIinstance());
   touch.setRotation(SCREEN_ROTATION);
+  initializeSdCard(true);
 
   preferences.begin("drybox", true);
   touchMinX = preferences.getInt("touchMinX", DEFAULT_TOUCH_MIN_X);
@@ -1395,6 +1741,7 @@ void loop() {
   handleTouch();
   processPendingPair();
   processPendingReadingAck();
+  processPendingHistoryAndLogs();
   const uint32_t now = millis();
   portENTER_CRITICAL(&nodeMux);
   const bool pulseReceiveLed = receiveLedPulsePending;
@@ -1409,6 +1756,7 @@ void loop() {
     receiveLedOffAtMs = 0;
   }
   handleWifiRecovery(now);
+  maintainSdStorage(now);
   const uint32_t beaconInterval = pairingActive ? 500 : 1000;
   if (lastPairBeaconMs == 0 || now - lastPairBeaconMs >= beaconInterval) {
     lastPairBeaconMs = now;

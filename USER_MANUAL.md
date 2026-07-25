@@ -12,6 +12,10 @@ The ACE Dry Box Monitor consists of:
 
 The wireless nodes report dry-box temperature and humidity to the controller through ESP-NOW. The controller uses Wi-Fi for time synchronization, weather, and the web dashboard.
 
+### Optional controller microSD card
+
+Use a reliable 8-32 GB microSD card formatted as FAT32. Insert it before powering the controller. The card stores detailed node CSV logs and restores the touchscreen's 24-hour graphs after a controller restart. Sensor monitoring continues normally when no card is installed.
+
 ### Optional sensor-node OLED
 
 Each sensor node can use a 0.91-inch 128x32 SSD1306 I2C OLED with a white display. Connect it in parallel with the AHT20:
@@ -253,5 +257,37 @@ Serial messages such as `[wifi] LOST`, `[wifi] reconnect attempt`, and `[wifi] R
 
 - Wireless ACE node transmission: every 30 seconds.
 - Local AHT20/BMP280 reading: every 30 seconds.
+- CSV buffer flush: every 30 seconds or when the buffer reaches approximately 2 KB.
+- Graph-history snapshot: every five minutes when history has changed.
+- Missing microSD retry: every 60 seconds.
+
+## 14. microSD files and status
+
+Open **Settings** and check:
+
+- **SD CARD: READY:** logging and persistent graph history are available.
+- **SD CARD: MISSING:** the controller is operating normally with RAM-only graph history.
+- **SD: _n.n_ GB FREE:** current available card capacity.
+- **SD: CLEANING OLD LOGS:** free space fell below 1 GB and automatic retention cleanup is running.
+- **SD CARD: LOW SPACE/FULL:** no safe completed daily log is available to remove, or the card has virtually no free space.
+
+Detailed node packets are stored in `/logs/YYYY-MM-DD.csv`. Packets received before the clock synchronizes are stored in `/logs/unsynced.csv` using controller uptime. Duplicate retransmissions with the same node sequence are omitted.
+
+The compact `/history.bin` file contains the five-minute samples used by the touchscreen graphs. The controller loads it during startup, allowing the most recent 24 hours to remain visible after a reset or power failure. The file is replaced through `/history.tmp` to reduce the chance of losing the previous valid snapshot during an interrupted write.
+
+Automatic retention starts below 1 GB free and deletes the oldest completed dated CSV log once per second until 2 GB is free. The controller protects the active day's log, `/logs/unsynced.csv`, and `/history.bin`. The web dashboard shows free and total capacity, and serial output identifies every deleted file.
+
+Power down the controller before removing the card. If a write fails or the card is removed, the controller reports the error over serial, falls back to RAM history, and retries card detection once per minute.
+
+## 15. Checking the installed firmware
+
+The controller reports its firmware version and short Git commit:
+
+- At startup in the serial monitor.
+- Near the bottom of the **Settings** screen.
+- In the Controller section of the web dashboard.
+- As `firmwareVersion` and `gitCommit` in `/api/status`.
+
+A commit ending in `-dirty` means the firmware was built from local tracked changes that had not yet been committed. After installing a release build, record both values when reporting a problem.
 - Offline indication: after two minutes without a valid node packet.
 - OpenWeather update: every 20 minutes.
