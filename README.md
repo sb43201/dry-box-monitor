@@ -164,11 +164,13 @@ platformio run -e sensor_wemos_d1_mini32 -t upload
 
 ## microSD logging and graph restoration
 
-Insert a FAT32-formatted microSD card before starting the controller. **Settings** shows **SD CARD: READY** when detected or **SD CARD: MISSING** when the controller is using RAM-only history. A missing or failed card does not stop ESP-NOW reception, the touchscreen, weather, or the in-memory graphs. The controller retries card detection once per minute.
+Insert a FAT32-formatted microSD card before starting the controller. **Settings** shows the card's free space or **SD CARD: MISSING** when the controller is using RAM-only history. The web dashboard also reports free and total space. A missing or failed card does not stop ESP-NOW reception, the touchscreen, weather, or the in-memory graphs. The controller retries card detection once per minute.
 
 Each new node packet sequence is buffered and written to `/logs/YYYY-MM-DD.csv`. Before network time is synchronized, rows are written to `/logs/unsynced.csv` with controller uptime. Duplicate radio retransmissions are not logged twice. The CSV contains node number, sequence, temperature in °C and °F, humidity, pressure, and packet flags.
 
 The controller saves the five-minute graph buckets to `/history.bin` using a temporary file and rename operation. On the next startup it restores up to 24 hours of graph data for every node. History continues in RAM if the card is removed. For card safety, power down the controller before removing the microSD card.
+
+When free space falls below 1 GB, the controller deletes the oldest completed `/logs/YYYY-MM-DD.csv` file once per second until at least 2 GB is free. It never deletes the current day's active log, `/logs/unsynced.csv`, or `/history.bin`. Settings displays the cleanup or low/full-space state, and each deletion is reported over serial.
 
 The controller target uses PlatformIO's `huge_app.csv` partition to leave safe firmware space for SD support. This project uploads firmware over USB and does not use OTA firmware updates.
 

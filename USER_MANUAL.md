@@ -267,10 +267,15 @@ Open **Settings** and check:
 
 - **SD CARD: READY:** logging and persistent graph history are available.
 - **SD CARD: MISSING:** the controller is operating normally with RAM-only graph history.
+- **SD: _n.n_ GB FREE:** current available card capacity.
+- **SD: CLEANING OLD LOGS:** free space fell below 1 GB and automatic retention cleanup is running.
+- **SD CARD: LOW SPACE/FULL:** no safe completed daily log is available to remove, or the card has virtually no free space.
 
 Detailed node packets are stored in `/logs/YYYY-MM-DD.csv`. Packets received before the clock synchronizes are stored in `/logs/unsynced.csv` using controller uptime. Duplicate retransmissions with the same node sequence are omitted.
 
 The compact `/history.bin` file contains the five-minute samples used by the touchscreen graphs. The controller loads it during startup, allowing the most recent 24 hours to remain visible after a reset or power failure. The file is replaced through `/history.tmp` to reduce the chance of losing the previous valid snapshot during an interrupted write.
+
+Automatic retention starts below 1 GB free and deletes the oldest completed dated CSV log once per second until 2 GB is free. The controller protects the active day's log, `/logs/unsynced.csv`, and `/history.bin`. The web dashboard shows free and total capacity, and serial output identifies every deleted file.
 
 Power down the controller before removing the card. If a write fails or the card is removed, the controller reports the error over serial, falls back to RAM history, and retries card detection once per minute.
 

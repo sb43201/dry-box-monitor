@@ -62,6 +62,10 @@ constexpr uint16_t HISTORY_BUCKETS = 24 * 60 / 5;
 constexpr uint32_t SD_LOG_FLUSH_MS = 30000;
 constexpr uint32_t SD_HISTORY_SAVE_MS = 5UL * 60UL * 1000UL;
 constexpr uint32_t SD_RETRY_MS = 60000;
+constexpr uint32_t SD_SPACE_CHECK_MS = 60000;
+constexpr uint32_t SD_CLEANUP_INTERVAL_MS = 1000;
+constexpr uint64_t SD_LOW_FREE_BYTES = 1ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr uint64_t SD_CLEANUP_TARGET_BYTES = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr uint32_t HISTORY_FILE_MAGIC = 0x48424441;
 constexpr uint16_t HISTORY_FILE_VERSION = 1;
 constexpr uint8_t BROADCAST_ADDRESS[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -188,10 +192,17 @@ bool wifiSkippedAtStartup = false;
 bool sdBusStarted = false;
 bool sdReady = false;
 bool sdHistoryDirty = false;
+bool sdCleanupActive = false;
+bool sdStorageFull = false;
+uint64_t sdTotalBytes = 0;
+uint64_t sdFreeBytes = 0;
+uint32_t sdDeletedLogCount = 0;
 uint32_t historyBootBucketBase = 0;
 uint32_t lastSdAttemptMs = 0;
 uint32_t lastSdLogFlushMs = 0;
 uint32_t lastSdHistorySaveMs = 0;
+uint32_t lastSdSpaceCheckMs = 0;
+uint32_t lastSdCleanupMs = 0;
 String sdLogBuffer;
 String sdLogPath;
 constexpr uint32_t WEATHER_INTERVAL_MS = 20UL * 60UL * 1000UL;
@@ -422,8 +433,79 @@ uint32_t historyBucketNow() {
   return max(clockBucket, fallbackBucket);
 }
 
-const char *sdStatusText() {
-  return sdReady ? "SD CARD: READY" : "SD CARD: MISSING";
+String sdStatusText() {
+  if (!sdReady) return "SD CARD: MISSING";
+  if (sdStorageFull) return "SD CARD: FULL";
+  if (sdCleanupActive) return "SD: CLEANING OLD LOGS";
+  if (sdFreeBytes < SD_LOW_FREE_BYTES) return "SD CARD: LOW SPACE";
+  const float freeGb = sdFreeBytes / (1024.0f * 1024.0f * 1024.0f);
+  return "SD: " + String(freeGb, 1) + " GB FREE";
+}
+
+void refreshSdSpace() {
+  if (!sdReady) {
+    sdTotalBytes = 0;
+    sdFreeBytes = 0;
+    sdStorageFull = false;
+    sdCleanupActive = false;
+    return;
+  }
+  sdTotalBytes = SD.totalBytes();
+  const uint64_t usedBytes = SD.usedBytes();
+  sdFreeBytes = usedBytes <= sdTotalBytes ? sdTotalBytes - usedBytes : 0;
+  sdStorageFull = sdFreeBytes < 1024ULL * 1024ULL;
+  if (sdFreeBytes < SD_LOW_FREE_BYTES) sdCleanupActive = true;
+  if (sdFreeBytes >= SD_CLEANUP_TARGET_BYTES) sdCleanupActive = false;
+  lastSdSpaceCheckMs = millis();
+}
+
+bool datedLogPath(const String &name, String &path) {
+  String base = name;
+  const int slash = base.lastIndexOf('/');
+  if (slash >= 0) base = base.substring(slash + 1);
+  if (base.length() != 14 || base.charAt(4) != '-' || base.charAt(7) != '-' || !base.endsWith(".csv")) return false;
+  for (uint8_t i = 0; i < 10; ++i) {
+    if (i == 4 || i == 7) continue;
+    if (!isDigit(base.charAt(i))) return false;
+  }
+  path = "/logs/" + base;
+  return true;
+}
+
+bool deleteOldestDatedLog() {
+  if (!sdReady) return false;
+  File directory = SD.open("/logs");
+  if (!directory || !directory.isDirectory()) {
+    if (directory) directory.close();
+    return false;
+  }
+  String oldestPath;
+  File entry = directory.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      String candidate;
+      if (datedLogPath(entry.name(), candidate) && candidate != sdLogPath &&
+          (!oldestPath.length() || candidate < oldestPath)) {
+        oldestPath = candidate;
+      }
+    }
+    entry.close();
+    entry = directory.openNextFile();
+  }
+  directory.close();
+  if (!oldestPath.length()) {
+    Serial.println("[sd] storage low but no completed dated CSV logs can be deleted");
+    return false;
+  }
+  if (!SD.remove(oldestPath)) {
+    Serial.printf("[sd] failed to delete oldest log path=%s\n", oldestPath.c_str());
+    return false;
+  }
+  ++sdDeletedLogCount;
+  Serial.printf("[sd] deleted oldest log path=%s cleanupCount=%lu\n", oldestPath.c_str(),
+                static_cast<unsigned long>(sdDeletedLogCount));
+  refreshSdSpace();
+  return true;
 }
 
 bool flushSdLogBuffer() {
@@ -451,6 +533,7 @@ bool flushSdLogBuffer() {
   Serial.printf("[sd] log flushed path=%s bytes=%u\n", sdLogPath.c_str(), static_cast<unsigned>(written));
   sdLogBuffer = "";
   lastSdLogFlushMs = millis();
+  refreshSdSpace();
   return true;
 }
 
@@ -514,6 +597,7 @@ bool saveHistoryToSd() {
   lastSdHistorySaveMs = millis();
   Serial.printf("[sd] 24-hour history saved bytes=%u\n",
                 static_cast<unsigned>(sizeof(header) + sizeof(sdHistoryBuffer)));
+  refreshSdSpace();
   return true;
 }
 
@@ -564,7 +648,10 @@ bool initializeSdCard(bool restoreHistory) {
   }
   SD.mkdir("/logs");
   sdLogBuffer.reserve(2048);
-  Serial.printf("[sd] ready size=%lluMB\n", static_cast<unsigned long long>(SD.cardSize() / (1024ULL * 1024ULL)));
+  refreshSdSpace();
+  Serial.printf("[sd] ready size=%lluMB free=%lluMB\n",
+                static_cast<unsigned long long>(sdTotalBytes / (1024ULL * 1024ULL)),
+                static_cast<unsigned long long>(sdFreeBytes / (1024ULL * 1024ULL)));
   if (restoreHistory) loadHistoryFromSd();
   return true;
 }
@@ -595,6 +682,11 @@ void maintainSdStorage(uint32_t now) {
   if (sdHistoryDirty &&
       (lastSdHistorySaveMs == 0 || now - lastSdHistorySaveMs >= SD_HISTORY_SAVE_MS)) {
     saveHistoryToSd();
+  }
+  if (now - lastSdSpaceCheckMs >= SD_SPACE_CHECK_MS) refreshSdSpace();
+  if (sdCleanupActive && now - lastSdCleanupMs >= SD_CLEANUP_INTERVAL_MS) {
+    lastSdCleanupMs = now;
+    if (!deleteOldestDatedLog()) sdCleanupActive = false;
   }
 }
 
@@ -1101,7 +1193,13 @@ void sendJsonStatus() {
   json.reserve(1800);
   json = "{\"hostname\":\"" + hostname + "\",\"firmwareVersion\":\"" + FIRMWARE_VERSION +
          "\",\"gitCommit\":\"" + GIT_COMMIT + "\",\"ip\":\"" + WiFi.localIP().toString() +
-         "\",\"channel\":" + String(WiFi.channel()) + ",\"goodLimitRh\":" + String(goodLimitRh, 0) +
+         "\",\"channel\":" + String(WiFi.channel()) + ",\"sdReady\":" + String(sdReady ? "true" : "false") +
+         ",\"sdFreeMB\":" + String(static_cast<unsigned long long>(sdFreeBytes / (1024ULL * 1024ULL))) +
+         ",\"sdTotalMB\":" + String(static_cast<unsigned long long>(sdTotalBytes / (1024ULL * 1024ULL))) +
+         ",\"sdCleanupActive\":" + String(sdCleanupActive ? "true" : "false") +
+         ",\"sdStorageFull\":" + String(sdStorageFull ? "true" : "false") +
+         ",\"sdDeletedLogs\":" + String(sdDeletedLogCount) +
+         ",\"goodLimitRh\":" + String(goodLimitRh, 0) +
          ",\"warningLimitRh\":" + String(warningLimitRh, 0) + ",\"nodes\":[";
   for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
     if (i) json += ',';
@@ -1147,10 +1245,11 @@ body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margi
   page += FIRMWARE_VERSION;
   page += " &nbsp; Git ";
   page += GIT_COMMIT;
-  page += F(R"HTML(</p><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
+  page += F(R"HTML(</p><p class=meta id=storage>Loading storage...</p><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
 <script>
 async function post(url){await fetch(url,{method:'POST'});setTimeout(load,300)}
 async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel+'  |  FW '+d.firmwareVersion+' ('+d.gitCommit+')';
+storage.textContent=!d.sdReady?'SD card missing':d.sdStorageFull?'SD card full':d.sdCleanupActive?'SD cleanup active — '+(d.sdFreeMB/1024).toFixed(1)+' GB free':'SD card — '+(d.sdFreeMB/1024).toFixed(1)+' GB free of '+(d.sdTotalMB/1024).toFixed(1)+' GB; '+d.sdDeletedLogs+' old logs deleted';
 nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?(n.online?'SENSOR ERROR':'OFFLINE'):'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
 pairButtons.innerHTML=d.nodes.filter(n=>!n.paired).map(n=>`<button onclick="post('/pair?slot=${n.id}')">Pair ${n.name}</button>`).join('')||'All slots are paired.';}catch(e){connection.textContent='Controller unavailable';}}load();setInterval(load,3000);
 </script></body></html>)HTML");
