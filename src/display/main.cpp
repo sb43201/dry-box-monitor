@@ -16,7 +16,16 @@
 #include "protocol.h"
 #include "weather.h"
 
+#ifndef DRYBOX_FIRMWARE_VERSION
+#define DRYBOX_FIRMWARE_VERSION "unknown"
+#endif
+#ifndef DRYBOX_GIT_COMMIT
+#define DRYBOX_GIT_COMMIT "unknown"
+#endif
+
 namespace {
+constexpr const char *FIRMWARE_VERSION = DRYBOX_FIRMWARE_VERSION;
+constexpr const char *GIT_COMMIT = DRYBOX_GIT_COMMIT;
 constexpr uint8_t TFT_BACKLIGHT = 27;
 constexpr uint8_t TOUCH_CS_PIN = 33;
 constexpr uint8_t TOUCH_IRQ = 36;
@@ -123,7 +132,6 @@ struct LocalSensorReading {
 };
 
 TFT_eSPI tft;
-SPIClass touchSpi(HSPI);
 SPIClass sdSpi(VSPI);
 XPT2046_Touchscreen touch(TOUCH_CS_PIN, TOUCH_IRQ);
 Preferences preferences;
@@ -475,7 +483,7 @@ void queueSdLogRow(const DryBoxProtocol::SensorPacket &packet, uint32_t received
 
 bool saveHistoryToSd() {
   if (!sdReady) return false;
-  SD.remove("/history.tmp");
+  if (SD.exists("/history.tmp")) SD.remove("/history.tmp");
   File file = SD.open("/history.tmp", FILE_WRITE);
   if (!file) {
     Serial.println("[sd] history temporary file open failed");
@@ -491,12 +499,12 @@ bool saveHistoryToSd() {
   file.flush();
   file.close();
   if (headerWritten != sizeof(header) || historyWritten != sizeof(sdHistoryBuffer)) {
-    SD.remove("/history.tmp");
+    if (SD.exists("/history.tmp")) SD.remove("/history.tmp");
     Serial.println("[sd] history write incomplete");
     sdReady = false;
     return false;
   }
-  SD.remove("/history.bin");
+  if (SD.exists("/history.bin")) SD.remove("/history.bin");
   if (!SD.rename("/history.tmp", "/history.bin")) {
     Serial.println("[sd] history rename failed");
     sdReady = false;
@@ -897,7 +905,8 @@ void drawSettings() {
   fillButton(256, 242, 54, 48, "+", 0x3186);
   tft.setTextColor(sdReady ? COLOR_GOOD : COLOR_WARN, COLOR_BG);
   tft.setTextDatum(MC_DATUM);
-  tft.drawString(sdStatusText(), SCREEN_WIDTH / 2, 312, 2);
+  tft.drawString("FW " + String(FIRMWARE_VERSION) + "  " + GIT_COMMIT, SCREEN_WIDTH / 2, 300, 1);
+  tft.drawString(sdStatusText(), SCREEN_WIDTH / 2, 316, 2);
   tft.setTextDatum(TL_DATUM);
   fillButton(8, 332, 148, 56, "PAIR NODES", 0x3186);
   fillButton(164, 332, 148, 56, "CAL TOUCH", 0x3186);
@@ -1090,7 +1099,8 @@ void sendJsonStatus() {
   const uint32_t now = millis();
   String json;
   json.reserve(1800);
-  json = "{\"hostname\":\"" + hostname + "\",\"ip\":\"" + WiFi.localIP().toString() +
+  json = "{\"hostname\":\"" + hostname + "\",\"firmwareVersion\":\"" + FIRMWARE_VERSION +
+         "\",\"gitCommit\":\"" + GIT_COMMIT + "\",\"ip\":\"" + WiFi.localIP().toString() +
          "\",\"channel\":" + String(WiFi.channel()) + ",\"goodLimitRh\":" + String(goodLimitRh, 0) +
          ",\"warningLimitRh\":" + String(warningLimitRh, 0) + ",\"nodes\":[";
   for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
@@ -1133,10 +1143,14 @@ body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margi
           String(weatherImperial ? " checked" : "") + "> Fahrenheit / mph</label><br><button>Save weather</button></form></div>";
   page += F(R"HTML(<div class=panel><h2>Controller</h2><form method=post action=/hostname><label>Hostname </label><input name=host maxlength=32 pattern="[a-zA-Z0-9-]+" value=")HTML");
   page += hostname;
-  page += F(R"HTML("><button>Save and restart</button></form><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
+  page += F(R"HTML("><button>Save and restart</button></form><p class=meta>Firmware )HTML");
+  page += FIRMWARE_VERSION;
+  page += " &nbsp; Git ";
+  page += GIT_COMMIT;
+  page += F(R"HTML(</p><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
 <script>
 async function post(url){await fetch(url,{method:'POST'});setTimeout(load,300)}
-async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel;
+async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel+'  |  FW '+d.firmwareVersion+' ('+d.gitCommit+')';
 nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?(n.online?'SENSOR ERROR':'OFFLINE'):'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
 pairButtons.innerHTML=d.nodes.filter(n=>!n.paired).map(n=>`<button onclick="post('/pair?slot=${n.id}')">Pair ${n.name}</button>`).join('')||'All slots are paired.';}catch(e){connection.textContent='Controller unavailable';}}load();setInterval(load,3000);
 </script></body></html>)HTML");
@@ -1538,6 +1552,7 @@ void sendPairBeacon() {
 
 void setup() {
   Serial.begin(115200);
+  Serial.printf("\n[firmware] version=%s commit=%s built=%s %s\n", FIRMWARE_VERSION, GIT_COMMIT, __DATE__, __TIME__);
   pinMode(RECEIVE_LED_PIN, OUTPUT);
   digitalWrite(RECEIVE_LED_PIN, RECEIVE_LED_OFF);
   pinMode(TFT_BACKLIGHT, OUTPUT);
@@ -1548,8 +1563,7 @@ void setup() {
   tft.fillScreen(COLOR_BG);
   tft.setTextWrap(false);
 
-  touchSpi.begin(TOUCH_SCK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS_PIN);
-  touch.begin(touchSpi);
+  touch.begin(TFT_eSPI::getSPIinstance());
   touch.setRotation(SCREEN_ROTATION);
   initializeSdCard(true);
 

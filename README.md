@@ -172,6 +172,16 @@ The controller saves the five-minute graph buckets to `/history.bin` using a tem
 
 The controller target uses PlatformIO's `huge_app.csv` partition to leave safe firmware space for SD support. This project uploads firmware over USB and does not use OTA firmware updates.
 
+## Firmware identification
+
+The controller firmware version and short Git commit are shown in three places:
+
+- Startup serial output, for example `[firmware] version=1.0.0 commit=6a5e2eb`.
+- The controller **Settings** screen.
+- The web dashboard and `/api/status`.
+
+PlatformIO generates the commit identifier automatically. Builds made with uncommitted tracked changes append `-dirty`, making it clear that the installed firmware does not exactly match a Git commit.
+
 ## Calibration
 
 The display uses the Plane Radar project's default touch calibration. If touch positions are inaccurate, update `TOUCH_MIN_X`, `TOUCH_MAX_X`, `TOUCH_MIN_Y`, and `TOUCH_MAX_Y` near the top of `src/display/main.cpp`.

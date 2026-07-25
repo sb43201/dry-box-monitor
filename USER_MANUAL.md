@@ -273,5 +273,16 @@ Detailed node packets are stored in `/logs/YYYY-MM-DD.csv`. Packets received bef
 The compact `/history.bin` file contains the five-minute samples used by the touchscreen graphs. The controller loads it during startup, allowing the most recent 24 hours to remain visible after a reset or power failure. The file is replaced through `/history.tmp` to reduce the chance of losing the previous valid snapshot during an interrupted write.
 
 Power down the controller before removing the card. If a write fails or the card is removed, the controller reports the error over serial, falls back to RAM history, and retries card detection once per minute.
+
+## 15. Checking the installed firmware
+
+The controller reports its firmware version and short Git commit:
+
+- At startup in the serial monitor.
+- Near the bottom of the **Settings** screen.
+- In the Controller section of the web dashboard.
+- As `firmwareVersion` and `gitCommit` in `/api/status`.
+
+A commit ending in `-dirty` means the firmware was built from local tracked changes that had not yet been committed. After installing a release build, record both values when reporting a problem.
 - Offline indication: after two minutes without a valid node packet.
 - OpenWeather update: every 20 minutes.
