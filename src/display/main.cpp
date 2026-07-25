@@ -159,6 +159,9 @@ uint32_t validPacketCount = 0;
 uint32_t lastRedrawMs = 0;
 uint32_t lastTouchMs = 0;
 int8_t detailNode = -1;
+uint32_t detailRenderedBucket = UINT32_MAX;
+bool detailRenderedOnline = false;
+bool detailRenderedSensorOk = false;
 bool settingsScreen = false;
 bool pairingScreen = false;
 bool pairingActive = false;
@@ -919,6 +922,57 @@ void drawWeather() {
   fillButton(216, 418, 96, 51, "REFRESH", 0x056B);
 }
 
+void drawDetail(uint8_t index);
+
+void drawDetailLiveValues(uint8_t index, const NodeState &node, uint32_t now) {
+  const bool isOnline = online(node, now);
+  const bool sensorOk = isOnline && (node.packet.flags & DryBoxProtocol::FLAG_SENSOR_OK);
+  if (isOnline != detailRenderedOnline || sensorOk != detailRenderedSensorOk) {
+    drawDetail(index);
+    return;
+  }
+  if (!sensorOk) return;
+
+  tft.fillRect(0, 55, SCREEN_WIDTH, 42, COLOR_BG);
+  tft.fillRect(0, 395, SCREEN_WIDTH, 20, COLOR_BG);
+  const uint16_t color = statusColor(node.packet.humidityRh);
+  char value[40];
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, COLOR_BG);
+  const float temperatureF = node.packet.temperatureC * 9.0f / 5.0f + 32.0f;
+  snprintf(value, sizeof(value), "%.1f C / %.1f F", node.packet.temperatureC, temperatureF);
+  tft.drawString(value, 10, 61, 4);
+  tft.setTextColor(color, COLOR_BG);
+  snprintf(value, sizeof(value), "%.1f%% RH", node.packet.humidityRh);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(value, 310, 64, 2);
+  tft.drawString(statusText(node.packet.humidityRh), 310, 80, 2);
+  tft.setTextDatum(TL_DATUM);
+  if (node.packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK) {
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    snprintf(value, sizeof(value), "%.1f hPa", node.packet.pressureHpa);
+    tft.drawString(value, 10, 87, 1);
+  }
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
+  snprintf(value, sizeof(value), "Packet %lu  Age %lus", static_cast<unsigned long>(node.packet.sequence),
+           static_cast<unsigned long>((now - node.receivedMs) / 1000));
+  tft.drawString(value, 31, 402, 1);
+}
+
+void drawDetailLive(uint8_t index) {
+  NodeState node;
+  NodeHistory history;
+  portENTER_CRITICAL(&nodeMux);
+  node = nodes[index];
+  history = nodeHistory[index];
+  portEXIT_CRITICAL(&nodeMux);
+  if (history.lastBucket != detailRenderedBucket) {
+    drawDetail(index);
+    return;
+  }
+  drawDetailLiveValues(index, node, millis());
+}
+
 void drawDetail(uint8_t index) {
   NodeState node;
   NodeHistory history;
@@ -927,6 +981,9 @@ void drawDetail(uint8_t index) {
   history = nodeHistory[index];
   portEXIT_CRITICAL(&nodeMux);
   const uint32_t now = millis();
+  detailRenderedBucket = history.lastBucket;
+  detailRenderedOnline = online(node, now);
+  detailRenderedSensorOk = detailRenderedOnline && (node.packet.flags & DryBoxProtocol::FLAG_SENSOR_OK);
 
   tft.fillScreen(COLOR_BG);
   drawHeader(nodeName(index), online(node, now) ? "ONLINE" : "OFFLINE");
@@ -947,31 +1004,9 @@ void drawDetail(uint8_t index) {
     return;
   }
 
-  const uint16_t color = statusColor(node.packet.humidityRh);
-  char value[40];
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(TFT_WHITE, COLOR_BG);
-  const float temperatureF = node.packet.temperatureC * 9.0f / 5.0f + 32.0f;
-  snprintf(value, sizeof(value), "%.1f C / %.1f F", node.packet.temperatureC, temperatureF);
-  tft.drawString(value, 10, 61, 4);
-  tft.setTextColor(color, COLOR_BG);
-  snprintf(value, sizeof(value), "%.1f%% RH", node.packet.humidityRh);
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(value, 310, 64, 2);
-  tft.drawString(statusText(node.packet.humidityRh), 310, 80, 2);
-  tft.setTextDatum(TL_DATUM);
-  if (node.packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK) {
-    tft.setTextColor(COLOR_MUTED, COLOR_BG);
-    snprintf(value, sizeof(value), "%.1f hPa", node.packet.pressureHpa);
-    tft.drawString(value, 10, 87, 1);
-  }
   drawHistoryPlot(history, true, 98, COLOR_WARN);
   drawHistoryPlot(history, false, 250, 0x07FF);
-  tft.setTextColor(COLOR_MUTED, COLOR_BG);
-  snprintf(value, sizeof(value), "Packet %lu  Age %lus", static_cast<unsigned long>(node.packet.sequence),
-           static_cast<unsigned long>((now - node.receivedMs) / 1000));
-  tft.drawString(value, 31, 402, 1);
-  tft.setTextDatum(TL_DATUM);
+  drawDetailLiveValues(index, node, now);
 }
 
 void drawSettings() {
@@ -1781,7 +1816,8 @@ void loop() {
   if (!settingsScreen && (packetRefresh || now - lastRedrawMs >= refreshInterval)) {
     packetPendingRedraw = false;
     lastRedrawMs = now;
-    redraw();
+    if (detailNode >= 0) drawDetailLive(detailNode);
+    else redraw();
   }
   delay(10);
 }
