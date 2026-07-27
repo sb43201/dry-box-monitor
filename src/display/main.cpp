@@ -1322,11 +1322,49 @@ void sendJsonStatus() {
   webServer.send(200, "application/json", json);
 }
 
+void sendJsonHistory() {
+  const int requestedNode = webServer.arg("node").toInt();
+  if (requestedNode < 1 || requestedNode > DryBoxProtocol::NODE_COUNT) {
+    webServer.send(400, "application/json", "{\"error\":\"node must be 1-10\"}");
+    return;
+  }
+  const uint8_t index = requestedNode - 1;
+  NodeHistory history;
+  portENTER_CRITICAL(&nodeMux);
+  history = nodeHistory[index];
+  portEXIT_CRITICAL(&nodeMux);
+
+  String json;
+  json.reserve(18000);
+  json = "{\"node\":" + String(requestedNode) + ",\"name\":\"" + nodeName(index) + "\",\"samples\":[";
+  uint32_t newestBucket = 0;
+  for (uint16_t n = 0; n < history.count; ++n) {
+    const uint16_t sampleIndex = (history.head + HISTORY_BUCKETS - history.count + n) % HISTORY_BUCKETS;
+    newestBucket = max(newestBucket, history.samples[sampleIndex].bucket);
+  }
+  bool first = true;
+  for (uint16_t n = 0; n < history.count; ++n) {
+    const uint16_t sampleIndex = (history.head + HISTORY_BUCKETS - history.count + n) % HISTORY_BUCKETS;
+    const HistorySample &sample = history.samples[sampleIndex];
+    const uint32_t ageBuckets = newestBucket >= sample.bucket ? newestBucket - sample.bucket : 0;
+    if (ageBuckets >= HISTORY_BUCKETS) continue;
+    if (!first) json += ',';
+    first = false;
+    json += "{\"minutesAgo\":" + String(ageBuckets * 5UL) +
+            ",\"temperatureC\":" + String(sample.temperatureCenti / 100.0f, 2) +
+            ",\"humidityRh\":" + String(sample.humidityCenti / 100.0f, 2) + '}';
+  }
+  json += "]}";
+  webServer.sendHeader("Cache-Control", "no-store");
+  webServer.send(200, "application/json", json);
+}
+
 void sendWebDashboard() {
   String page = F(R"HTML(<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Dry Box Monitor</title><style>
-body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border:3px solid #60747e;border-left-width:12px;border-radius:9px;padding:14px}.good{border-color:#00e5ff}.warn{border-color:#ffe600;border-style:double}.bad{border-color:#ff2020;border-style:dashed}.off{opacity:.65}.value{font-size:29px;font-weight:700}.state{font-size:18px;font-weight:800;letter-spacing:.08em}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}</style></head><body>
+body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border:3px solid #60747e;border-left-width:12px;border-radius:9px;padding:14px}.good{border-color:#00e5ff}.warn{border-color:#ffe600}.bad{border-color:#ff2020}.off{opacity:.65}.marker{width:14px;height:46px;float:left;margin:0 10px 4px -8px;border-radius:4px}.good .marker{background:#00e5ff}.warn .marker{background:repeating-linear-gradient(135deg,#ffe600 0 5px,#12242e 5px 9px)}.bad .marker{background-color:#ff2020;background-image:linear-gradient(45deg,transparent 40%,#12242e 40% 52%,transparent 52%),linear-gradient(-45deg,transparent 40%,#12242e 40% 52%,transparent 52%);background-size:14px 14px}.off .marker{border:2px dashed #9fb2bd;box-sizing:border-box}.value{font-size:29px;font-weight:700;clear:both}.state{font-size:18px;font-weight:800;letter-spacing:.08em}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}#historyPanel{display:none}canvas{width:100%;height:auto;background:#07131b;border:1px solid #60747e;border-radius:6px}</style></head><body>
 <h1>ACE Dry Box Monitor</h1><p class=sub id=connection>Loading...</p><div class=grid id=nodes></div>
+<div class=panel id=historyPanel><h2 id=historyTitle>24-hour history</h2><p class=meta>Five-minute samples stored by the controller. Temperature is yellow; humidity is cyan.</p><canvas id=historyCanvas width=900 height=380></canvas></div>
 <div class=panel><h2>Node setup</h2><p>Select an empty slot on the touchscreen, or start pairing here:</p><span id=pairButtons></span></div>
 <div class=panel><h2>Weather setup</h2><form method=post action=/weather-settings><label>OpenWeather API key </label><input type=password name=key placeholder="Leave blank to keep saved key"><br><label>Location </label><input name=place value=")HTML");
   page += weatherLocation;
@@ -1348,9 +1386,26 @@ body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margi
   page += F(R"HTML(</p><p class=meta id=storage>Loading storage...</p><form method=post action=/wifi-reset onsubmit="return confirm('Erase Wi-Fi and restart setup?')"><button class=danger>Change Wi-Fi</button></form></div>
 <script>
 async function post(url){await fetch(url,{method:'POST'});setTimeout(load,300)}
+function plotSeries(ctx,samples,key,top,height,color,label,unit){
+let values=samples.map(s=>s[key]).filter(Number.isFinite);if(!values.length)return;
+let lo=Math.min(...values),hi=Math.max(...values),pad=Math.max((hi-lo)*.12,key==='temperatureC'?.5:2);lo-=pad;hi+=pad;
+let left=58,right=884,bottom=top+height;ctx.strokeStyle='#60747e';ctx.strokeRect(left,top,right-left,height);
+ctx.fillStyle=color;ctx.font='bold 15px system-ui';ctx.fillText(label,left,top-8);
+ctx.fillStyle='#9fb2bd';ctx.font='12px system-ui';ctx.fillText(hi.toFixed(key==='temperatureC'?1:0)+unit,4,top+8);ctx.fillText(lo.toFixed(key==='temperatureC'?1:0)+unit,4,bottom);
+ctx.strokeStyle=color;ctx.lineWidth=3;ctx.beginPath();let started=false;
+samples.forEach(s=>{let v=s[key];if(!Number.isFinite(v))return;let x=right-(s.minutesAgo/1440)*(right-left),y=bottom-(v-lo)/(hi-lo)*height;if(!started){ctx.moveTo(x,y);started=true}else ctx.lineTo(x,y)});ctx.stroke();
+ctx.fillStyle='#9fb2bd';ctx.fillText('-24h',left,bottom+17);ctx.fillText('NOW',right-28,bottom+17);
+}
+async function showHistory(id,name){
+let panel=document.getElementById('historyPanel'),title=document.getElementById('historyTitle'),canvas=document.getElementById('historyCanvas');
+panel.style.display='block';title.textContent=name+' - loading history...';panel.scrollIntoView({behavior:'smooth',block:'start'});
+try{let r=await fetch('/api/history?node='+id,{cache:'no-store'});if(!r.ok)throw Error(r.status);let d=await r.json();title.textContent=d.name+' - 24-hour history';
+let ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);if(!d.samples.length){ctx.fillStyle='#9fb2bd';ctx.font='20px system-ui';ctx.fillText('Collecting history data',320,190);return}
+plotSeries(ctx,d.samples,'temperatureC',35,125,'#ffe600','TEMPERATURE 24H',' C');plotSeries(ctx,d.samples,'humidityRh',225,125,'#00e5ff','HUMIDITY 24H','%');
+}catch(e){title.textContent=name+' - history unavailable';}}
 async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel+'  |  FW '+d.firmwareVersion+' ('+d.gitCommit+')';
 storage.textContent=!d.sdReady?'SD card missing':d.sdStorageFull?'SD card full':d.sdCleanupActive?'SD cleanup active — '+(d.sdFreeMB/1024).toFixed(1)+' GB free':'SD card — '+(d.sdFreeMB/1024).toFixed(1)+' GB free of '+(d.sdTotalMB/1024).toFixed(1)+' GB; '+d.sdDeletedLogs+' old logs deleted';
-nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let state=!n.online?'OFFLINE':!n.sensorOk?'SENSOR ERROR':n.humidityRh<=d.goodLimitRh?'✓ DRY OK':n.humidityRh<d.warningLimitRh?'! CHECK':'!! HUMID';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=state>${state}</div><div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?state:'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
+nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let state=!n.online?'OFFLINE':!n.sensorOk?'SENSOR ERROR':n.humidityRh<=d.goodLimitRh?'DRY OK':n.humidityRh<d.warningLimitRh?'CHECK !':'HUMID !!';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=marker></div><div class=state>${state}</div><div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=marker></div><div class=value>${n.paired?state:'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.sensorOk?`<button onclick="showHistory(${n.id},'${n.name}')">24h graph</button>`:''}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
 pairButtons.innerHTML=d.nodes.filter(n=>!n.paired).map(n=>`<button onclick="post('/pair?slot=${n.id}')">Pair ${n.name}</button>`).join('')||'All slots are paired.';}catch(e){connection.textContent='Controller unavailable';}}load();setInterval(load,3000);
 </script></body></html>)HTML");
   webServer.send(200, "text/html", page);
@@ -1360,6 +1415,7 @@ void startWebServer() {
   if (WiFi.status() != WL_CONNECTED) return;
   webServer.on("/", HTTP_GET, sendWebDashboard);
   webServer.on("/api/status", HTTP_GET, sendJsonStatus);
+  webServer.on("/api/history", HTTP_GET, sendJsonHistory);
   webServer.on("/pair", HTTP_POST, []() {
     const int slot = webServer.arg("slot").toInt() - 1;
     if (slot < 0 || slot >= DryBoxProtocol::NODE_COUNT || slotPaired[slot]) {

@@ -162,6 +162,7 @@ platformio run -e sensor_wemos_d1_mini32 -t upload
 - Tap Settings to adjust the dry and humid thresholds. Values are stored in flash.
 - Default thresholds are 30% RH for Dry and 45% RH for Humid. The range between is Check.
 - Status does not depend on color alone: **DRY OK** uses a solid cyan marker, **CHECK !** uses a yellow striped marker, and **HUMID !!** uses a red cross-pattern marker. Offline sensors use a gray dashed outline.
+- The local web dashboard uses the same colors, labels, and marker patterns as the touchscreen. Select **24h graph** on an online sensor card to view its five-minute temperature and humidity history without requiring internet access.
 
 ## microSD logging and graph restoration
 
