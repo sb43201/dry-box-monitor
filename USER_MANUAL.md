@@ -184,6 +184,8 @@ Do not ground GPIO0 while applying power or resetting the board. GPIO0 low durin
 
 PlatformIO **Clean** is not an erase operation. It deletes local build files on the computer and leaves the board's pairing information unchanged.
 
+PlatformIO's **Erase Flash** task in VS Code is equivalent to running the matching `-t erase` command below. Before using it, select the correct sensor environment and COM port. A full erase removes the installed firmware as well as the saved ACE assignment, controller MAC, and radio channel. Upload the correct firmware again afterward. Do not confuse **Erase Flash** with **Clean**.
+
 For a full reset:
 
 1. Open the project folder containing `platformio.ini`.

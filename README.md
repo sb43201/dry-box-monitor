@@ -150,6 +150,8 @@ Grounding GPIO0 while powering on or resetting selects the ESP32 firmware-downlo
 
 Use this when an offline node cannot be reset normally. PlatformIO **Clean** only removes computer build files and does not clear pairing information on the board. Stop the serial monitor with `Ctrl+C`, connect only the node being reset, and replace `COM11` with its actual port.
 
+In VS Code, PlatformIO's **Erase Flash** project task performs the same full-board erase as the `-t erase` commands below. Select the correct sensor environment and COM port before running it. After **Erase Flash**, the firmware and saved pairing are gone, so upload the correct sensor environment again before pairing. **Erase Flash** and **Clean** are not the same operation.
+
 Wemos D1 Mini ESP32:
 
 ```powershell
