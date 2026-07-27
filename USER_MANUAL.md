@@ -168,11 +168,56 @@ To unpair from the touchscreen:
 2. Select the paired slot.
 3. Tap **UNPAIR**.
 
-If the node is online, the controller tells it to erase its pairing. This is the normal unpair method because Wemos D1 Mini ESP32 and ESP8266 boards do not provide a dedicated unpair button.
+The controller clears its slot even if an offline node cannot receive the command. If the node is online, the command also clears the assignment saved in the node. Always try this method first.
 
-For optional ESP32 recovery, start the node normally and then connect GPIO0 to GND for five seconds. Remove the connection when the serial monitor says pairing was cleared. Never ground GPIO0 while applying power or resetting the board because that can enter firmware-download mode.
+### Wemos D1 Mini ESP32 hardware reset
 
-The ESP8266 firmware does not support the GPIO0 runtime-unpair method. If an offline ESP8266 cannot receive the controller command, erase it with `platformio run -e sensor_wemos_d1_esp8266 -t erase` and upload it again. For an ESP32 node, use `platformio run -e sensor_wemos_d1_mini32 -t erase` followed by a normal upload.
+1. Start the ESP32 node normally.
+2. After boot, connect GPIO0 to GND for five seconds.
+3. Disconnect GPIO0 when the serial monitor reports `[pair] Pairing cleared`.
+4. Use **UNPAIR** to clear the old controller slot.
+5. Select an empty slot, tap **PAIR**, and restart the node if necessary.
+
+Do not ground GPIO0 while applying power or resetting the board. GPIO0 low during startup selects firmware-download mode rather than clearing the saved pairing.
+
+### Full erase and recovery
+
+PlatformIO **Clean** is not an erase operation. It deletes local build files on the computer and leaves the board's pairing information unchanged.
+
+PlatformIO's **Erase Flash** task in VS Code is equivalent to running the matching `-t erase` command below. Before using it, select the correct sensor environment and COM port. A full erase removes the installed firmware as well as the saved ACE assignment, controller MAC, and radio channel. Upload the correct firmware again afterward. Do not confuse **Erase Flash** with **Clean**.
+
+The port manually selected for PlatformIO's serial monitor does not always control the **Erase Flash** task. The task may auto-detect another connected board—for example, COM4 even though the intended node is on COM16. In that case, stop the serial monitor and use `--upload-port COM16` explicitly on both the erase and upload commands. Alternatively, temporarily place `upload_port = COM16` under the exact sensor environment in `platformio.ini`, run **Erase Flash** and **Upload** from that environment, and then remove the temporary line if the port assignment may change.
+
+For a full reset:
+
+1. Open the project folder containing `platformio.ini`.
+2. Connect only the node that needs resetting.
+3. Stop any serial monitor with `Ctrl+C`.
+4. Identify its COM port and replace `COM11` in the examples.
+5. Run the matching erase command and then the upload command.
+
+Wemos D1 Mini ESP32:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_mini32 -t erase --upload-port COM11
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_mini32 -t upload --upload-port COM11
+```
+
+Wemos D1 Mini ESP8266:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t erase --upload-port COM11
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t upload --upload-port COM11
+```
+
+The ESP8266 does not support the GPIO0 runtime-unpair method. Use controller **UNPAIR** when it is reachable or full erase/re-upload when it is not. After a full erase, clear the old controller slot, start pairing on the desired empty slot, and restart the node.
+
+Example for an ESP8266 connected to COM16:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t erase --upload-port COM16
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t upload --upload-port COM16
+```
 
 ## 9. Touchscreen recalibration
 
