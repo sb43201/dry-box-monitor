@@ -152,6 +152,8 @@ Use this when an offline node cannot be reset normally. PlatformIO **Clean** onl
 
 In VS Code, PlatformIO's **Erase Flash** project task performs the same full-board erase as the `-t erase` commands below. Select the correct sensor environment and COM port before running it. After **Erase Flash**, the firmware and saved pairing are gone, so upload the correct sensor environment again before pairing. **Erase Flash** and **Clean** are not the same operation.
 
+The port selected in PlatformIO's serial-monitor toolbar may not control the **Erase Flash** upload task. If the task auto-detects the wrong port, force the node's port on the command line with `--upload-port COM16` as shown below, or temporarily add `upload_port = COM16` inside the exact sensor environment in `platformio.ini`. Stop any serial monitor using that port first. Use the same forced port for both erase and upload, and remove the temporary `upload_port` line afterward if Windows may assign a different number later.
+
 Wemos D1 Mini ESP32:
 
 ```powershell
@@ -165,6 +167,8 @@ Wemos D1 Mini ESP8266:
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t erase --upload-port COM11
 & "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t upload --upload-port COM11
 ```
+
+For example, replace both occurrences of `COM11` with `COM16` when the node is connected to COM16.
 
 The ESP8266 does not use GPIO0 as a runtime unpair input, so controller **Unpair** or full erase/re-upload are its recovery methods. After erasing either board, clear the previous slot on the controller, start pairing on an empty slot, and restart the node.
 

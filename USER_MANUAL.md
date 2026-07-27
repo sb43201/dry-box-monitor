@@ -186,6 +186,8 @@ PlatformIO **Clean** is not an erase operation. It deletes local build files on 
 
 PlatformIO's **Erase Flash** task in VS Code is equivalent to running the matching `-t erase` command below. Before using it, select the correct sensor environment and COM port. A full erase removes the installed firmware as well as the saved ACE assignment, controller MAC, and radio channel. Upload the correct firmware again afterward. Do not confuse **Erase Flash** with **Clean**.
 
+The port manually selected for PlatformIO's serial monitor does not always control the **Erase Flash** task. The task may auto-detect another connected board—for example, COM4 even though the intended node is on COM16. In that case, stop the serial monitor and use `--upload-port COM16` explicitly on both the erase and upload commands. Alternatively, temporarily place `upload_port = COM16` under the exact sensor environment in `platformio.ini`, run **Erase Flash** and **Upload** from that environment, and then remove the temporary line if the port assignment may change.
+
 For a full reset:
 
 1. Open the project folder containing `platformio.ini`.
@@ -209,6 +211,13 @@ Wemos D1 Mini ESP8266:
 ```
 
 The ESP8266 does not support the GPIO0 runtime-unpair method. Use controller **UNPAIR** when it is reachable or full erase/re-upload when it is not. After a full erase, clear the old controller slot, start pairing on the desired empty slot, and restart the node.
+
+Example for an ESP8266 connected to COM16:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t erase --upload-port COM16
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t upload --upload-port COM16
+```
 
 ## 9. Touchscreen recalibration
 
