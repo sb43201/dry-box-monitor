@@ -81,7 +81,7 @@ Node colors use the configured humidity limits:
 - **OFFLINE:** no valid packet has arrived for two minutes.
 - **DRY OK:** solid cyan marker; humidity is at or below the Dry limit.
 - **CHECK !:** yellow diagonal-striped marker; humidity is between the Dry and Humid limits.
-- **HUMID !!:** magenta cross-pattern marker; humidity is at or above the Humid limit.
+- **HUMID !!:** red cross-pattern marker; humidity is at or above the Humid limit.
 
 The symbols, words, and marker patterns provide the same status information as the colors for users with color-vision differences.
 - **SENSOR ERROR:** the node is communicating but its sensor reading is invalid.
