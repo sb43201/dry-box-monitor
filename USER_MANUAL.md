@@ -168,11 +168,45 @@ To unpair from the touchscreen:
 2. Select the paired slot.
 3. Tap **UNPAIR**.
 
-If the node is online, the controller tells it to erase its pairing. This is the normal unpair method because Wemos D1 Mini ESP32 and ESP8266 boards do not provide a dedicated unpair button.
+The controller clears its slot even if an offline node cannot receive the command. If the node is online, the command also clears the assignment saved in the node. Always try this method first.
 
-For optional ESP32 recovery, start the node normally and then connect GPIO0 to GND for five seconds. Remove the connection when the serial monitor says pairing was cleared. Never ground GPIO0 while applying power or resetting the board because that can enter firmware-download mode.
+### Wemos D1 Mini ESP32 hardware reset
 
-The ESP8266 firmware does not support the GPIO0 runtime-unpair method. If an offline ESP8266 cannot receive the controller command, erase it with `platformio run -e sensor_wemos_d1_esp8266 -t erase` and upload it again. For an ESP32 node, use `platformio run -e sensor_wemos_d1_mini32 -t erase` followed by a normal upload.
+1. Start the ESP32 node normally.
+2. After boot, connect GPIO0 to GND for five seconds.
+3. Disconnect GPIO0 when the serial monitor reports `[pair] Pairing cleared`.
+4. Use **UNPAIR** to clear the old controller slot.
+5. Select an empty slot, tap **PAIR**, and restart the node if necessary.
+
+Do not ground GPIO0 while applying power or resetting the board. GPIO0 low during startup selects firmware-download mode rather than clearing the saved pairing.
+
+### Full erase and recovery
+
+PlatformIO **Clean** is not an erase operation. It deletes local build files on the computer and leaves the board's pairing information unchanged.
+
+For a full reset:
+
+1. Open the project folder containing `platformio.ini`.
+2. Connect only the node that needs resetting.
+3. Stop any serial monitor with `Ctrl+C`.
+4. Identify its COM port and replace `COM11` in the examples.
+5. Run the matching erase command and then the upload command.
+
+Wemos D1 Mini ESP32:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_mini32 -t erase --upload-port COM11
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_mini32 -t upload --upload-port COM11
+```
+
+Wemos D1 Mini ESP8266:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t erase --upload-port COM11
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t upload --upload-port COM11
+```
+
+The ESP8266 does not support the GPIO0 runtime-unpair method. Use controller **UNPAIR** when it is reachable or full erase/re-upload when it is not. After a full erase, clear the old controller slot, start pairing on the desired empty slot, and restart the node.
 
 ## 9. Touchscreen recalibration
 
