@@ -74,9 +74,11 @@ constexpr uint16_t COLOR_BG = 0x0841;
 constexpr uint16_t COLOR_PANEL = 0x10A2;
 constexpr uint16_t COLOR_HEADER = 0x018C;
 constexpr uint16_t COLOR_MUTED = 0xAD55;
-constexpr uint16_t COLOR_GOOD = 0x05E0;
-constexpr uint16_t COLOR_WARN = 0xFD20;
-constexpr uint16_t COLOR_BAD = 0xF800;
+// High-contrast accessibility palette. Text and marker patterns also identify status,
+// so meaning never depends on color alone.
+constexpr uint16_t COLOR_GOOD = 0x07FF;  // cyan
+constexpr uint16_t COLOR_WARN = 0xFFE0;  // yellow
+constexpr uint16_t COLOR_BAD = 0xF81F;   // magenta
 
 struct NodeState {
   DryBoxProtocol::SensorPacket packet{};
@@ -397,9 +399,30 @@ uint16_t statusColor(float humidity) {
 }
 
 const char *statusText(float humidity) {
-  if (humidity <= goodLimitRh) return "DRY";
-  if (humidity < warningLimitRh) return "CHECK";
-  return "HUMID";
+  if (humidity <= goodLimitRh) return "DRY OK";
+  if (humidity < warningLimitRh) return "CHECK !";
+  return "HUMID !!";
+}
+
+void drawStatusMarker(int16_t x, int16_t y, int16_t h, float humidity) {
+  const uint16_t color = statusColor(humidity);
+  tft.fillRoundRect(x, y, 13, h, 5, color);
+  if (humidity <= goodLimitRh) {
+    // Solid cyan bar.
+    return;
+  }
+  if (humidity < warningLimitRh) {
+    // Yellow diagonal stripes.
+    for (int16_t stripeY = y + 8; stripeY < y + h; stripeY += 12) {
+      tft.drawLine(x + 2, stripeY, x + 10, stripeY - 8, COLOR_PANEL);
+    }
+    return;
+  }
+  // Magenta cross pattern.
+  for (int16_t crossY = y + 8; crossY < y + h - 4; crossY += 14) {
+    tft.drawLine(x + 2, crossY - 4, x + 10, crossY + 4, COLOR_PANEL);
+    tft.drawLine(x + 10, crossY - 4, x + 2, crossY + 4, COLOR_PANEL);
+  }
 }
 
 bool online(const NodeState &node, uint32_t now) {
@@ -810,23 +833,30 @@ void drawOverview() {
     if (sensorOk) color = statusColor(snapshot[i].packet.humidityRh);
 
     tft.fillRoundRect(7, y, 306, 62, 7, COLOR_PANEL);
-    tft.fillRoundRect(7, y, 9, 62, 5, color);
+    if (sensorOk) {
+      drawStatusMarker(7, y, 62, snapshot[i].packet.humidityRh);
+    } else {
+      tft.drawRoundRect(7, y, 13, 62, 5, COLOR_MUTED);
+      for (int16_t dashY = y + 5; dashY < y + 58; dashY += 10) {
+        tft.drawFastVLine(13, dashY, 5, COLOR_MUTED);
+      }
+    }
     tft.setTextColor(TFT_WHITE, COLOR_PANEL);
-    tft.drawString(nodeName(i), 24, y + 8, 4);
+    tft.drawString(nodeName(i), 27, y + 8, 4);
 
     if (sensorOk) {
       char value[32];
       const float temperatureF = snapshot[i].packet.temperatureC * 9.0f / 5.0f + 32.0f;
       snprintf(value, sizeof(value), "%.1f C / %.1f F", snapshot[i].packet.temperatureC, temperatureF);
       tft.setTextColor(0xDFFF, COLOR_PANEL);
-      tft.drawString(value, 24, y + 38, 2);
+      tft.drawString(value, 27, y + 38, 2);
       snprintf(value, sizeof(value), "%.1f%%", snapshot[i].packet.humidityRh);
       tft.setTextDatum(MR_DATUM);
       tft.setTextColor(color, COLOR_PANEL);
       tft.drawString(value, 298, y + 24, 4);
       tft.setTextDatum(TL_DATUM);
       tft.setTextColor(color, COLOR_PANEL);
-      tft.drawString(statusText(snapshot[i].packet.humidityRh), 196, y + 43, 2);
+      tft.drawString(statusText(snapshot[i].packet.humidityRh), 188, y + 43, 2);
     } else {
       tft.setTextDatum(MR_DATUM);
       tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
@@ -1260,7 +1290,7 @@ void sendJsonStatus() {
 void sendWebDashboard() {
   String page = F(R"HTML(<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Dry Box Monitor</title><style>
-body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border-left:7px solid #60747e;border-radius:9px;padding:14px}.good{border-color:#20c970}.warn{border-color:#ffab23}.bad{border-color:#ef4444}.off{opacity:.65}.value{font-size:29px;font-weight:700}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}</style></head><body>
+body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border:3px solid #60747e;border-left-width:12px;border-radius:9px;padding:14px}.good{border-color:#00e5ff}.warn{border-color:#ffe600;border-style:double}.bad{border-color:#ff4dff;border-style:dashed}.off{opacity:.65}.value{font-size:29px;font-weight:700}.state{font-size:18px;font-weight:800;letter-spacing:.08em}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}</style></head><body>
 <h1>ACE Dry Box Monitor</h1><p class=sub id=connection>Loading...</p><div class=grid id=nodes></div>
 <div class=panel><h2>Node setup</h2><p>Select an empty slot on the touchscreen, or start pairing here:</p><span id=pairButtons></span></div>
 <div class=panel><h2>Weather setup</h2><form method=post action=/weather-settings><label>OpenWeather API key </label><input type=password name=key placeholder="Leave blank to keep saved key"><br><label>Location </label><input name=place value=")HTML");
@@ -1285,7 +1315,7 @@ body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margi
 async function post(url){await fetch(url,{method:'POST'});setTimeout(load,300)}
 async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel+'  |  FW '+d.firmwareVersion+' ('+d.gitCommit+')';
 storage.textContent=!d.sdReady?'SD card missing':d.sdStorageFull?'SD card full':d.sdCleanupActive?'SD cleanup active — '+(d.sdFreeMB/1024).toFixed(1)+' GB free':'SD card — '+(d.sdFreeMB/1024).toFixed(1)+' GB free of '+(d.sdTotalMB/1024).toFixed(1)+' GB; '+d.sdDeletedLogs+' old logs deleted';
-nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?(n.online?'SENSOR ERROR':'OFFLINE'):'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
+nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let state=!n.online?'OFFLINE':!n.sensorOk?'SENSOR ERROR':n.humidityRh<=d.goodLimitRh?'✓ DRY OK':n.humidityRh<d.warningLimitRh?'! CHECK':'!! HUMID';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=state>${state}</div><div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?state:'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
 pairButtons.innerHTML=d.nodes.filter(n=>!n.paired).map(n=>`<button onclick="post('/pair?slot=${n.id}')">Pair ${n.name}</button>`).join('')||'All slots are paired.';}catch(e){connection.textContent='Controller unavailable';}}load();setInterval(load,3000);
 </script></body></html>)HTML");
   webServer.send(200, "text/html", page);

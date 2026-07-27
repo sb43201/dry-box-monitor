@@ -161,6 +161,7 @@ platformio run -e sensor_wemos_d1_mini32 -t upload
 - Touch calibration runs automatically the first time the controller starts. Tap and release all four crosshairs. The calculated bounds are saved in flash. Use **Settings > Cal Touch** to repeat calibration later.
 - Tap Settings to adjust the dry and humid thresholds. Values are stored in flash.
 - Default thresholds are 30% RH for Dry and 45% RH for Humid. The range between is Check.
+- Status does not depend on color alone: **DRY OK** uses a solid cyan marker, **CHECK !** uses a yellow striped marker, and **HUMID !!** uses a magenta cross-pattern marker. Offline sensors use a gray dashed outline.
 
 ## microSD logging and graph restoration
 
