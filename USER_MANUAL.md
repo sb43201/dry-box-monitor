@@ -84,6 +84,8 @@ Node colors use the configured humidity limits:
 - **HUMID !!:** red cross-pattern marker; humidity is at or above the Humid limit.
 
 The symbols, words, and marker patterns provide the same status information as the colors for users with color-vision differences.
+
+The web dashboard follows the same status design. Press **24h graph** on an online sensor card to display that node's temperature and humidity history. The graph uses the controller's locally stored five-minute samples, works without internet access, and can show restored SD-card history after a controller restart.
 - **SENSOR ERROR:** the node is communicating but its sensor reading is invalid.
 
 Open **SET** to adjust the Dry and Humid thresholds. Tap **SAVE & BACK** to store them.
