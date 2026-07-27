@@ -1305,9 +1305,14 @@ void sendJsonStatus() {
             ",\"sensorOk\":" + String(sensorOk ? "true" : "false");
     if (sensorOk) {
       json += ",\"temperatureC\":" + String(snapshot[i].packet.temperatureC, 1) +
-              ",\"humidityRh\":" + String(snapshot[i].packet.humidityRh, 1) +
-              ",\"pressureHpa\":" + String(snapshot[i].packet.pressureHpa, 1) +
-              ",\"sequence\":" + String(snapshot[i].packet.sequence) +
+              ",\"humidityRh\":" + String(snapshot[i].packet.humidityRh, 1);
+      if ((snapshot[i].packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK) &&
+          isfinite(snapshot[i].packet.pressureHpa)) {
+        json += ",\"pressureHpa\":" + String(snapshot[i].packet.pressureHpa, 1);
+      } else {
+        json += ",\"pressureHpa\":null";
+      }
+      json += ",\"sequence\":" + String(snapshot[i].packet.sequence) +
               ",\"ageSeconds\":" + String((now - snapshot[i].receivedMs) / 1000UL);
     }
     json += '}';
