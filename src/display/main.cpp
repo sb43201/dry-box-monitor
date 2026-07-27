@@ -74,9 +74,11 @@ constexpr uint16_t COLOR_BG = 0x0841;
 constexpr uint16_t COLOR_PANEL = 0x10A2;
 constexpr uint16_t COLOR_HEADER = 0x018C;
 constexpr uint16_t COLOR_MUTED = 0xAD55;
-constexpr uint16_t COLOR_GOOD = 0x05E0;
-constexpr uint16_t COLOR_WARN = 0xFD20;
-constexpr uint16_t COLOR_BAD = 0xF800;
+// High-contrast accessibility palette. Text and marker patterns also identify status,
+// so meaning never depends on color alone.
+constexpr uint16_t COLOR_GOOD = 0x07FF;  // cyan
+constexpr uint16_t COLOR_WARN = 0xFFE0;  // yellow
+constexpr uint16_t COLOR_BAD = 0xF81F;   // magenta
 
 struct NodeState {
   DryBoxProtocol::SensorPacket packet{};
@@ -159,6 +161,9 @@ uint32_t validPacketCount = 0;
 uint32_t lastRedrawMs = 0;
 uint32_t lastTouchMs = 0;
 int8_t detailNode = -1;
+uint32_t detailRenderedBucket = UINT32_MAX;
+bool detailRenderedOnline = false;
+bool detailRenderedSensorOk = false;
 bool settingsScreen = false;
 bool pairingScreen = false;
 bool pairingActive = false;
@@ -166,8 +171,13 @@ uint8_t selectedPairSlot = 0;
 uint32_t pairingEndsMs = 0;
 volatile bool packetPendingRedraw = false;
 volatile bool receiveLedPulsePending = false;
+volatile uint16_t overviewDirtyMask = 0;
 uint32_t receiveLedOffAtMs = 0;
 uint8_t overviewPage = 0;
+bool overviewRenderedOnline[DryBoxProtocol::NODE_COUNT]{};
+bool overviewRenderedSensorOk[DryBoxProtocol::NODE_COUNT]{};
+uint8_t overviewRenderedOnlineCount = UINT8_MAX;
+int overviewRenderedWifiStatus = -1;
 String hostname = "drybox-monitor";
 WebServer webServer(80);
 bool webServerStarted = false;
@@ -394,9 +404,30 @@ uint16_t statusColor(float humidity) {
 }
 
 const char *statusText(float humidity) {
-  if (humidity <= goodLimitRh) return "DRY";
-  if (humidity < warningLimitRh) return "CHECK";
-  return "HUMID";
+  if (humidity <= goodLimitRh) return "DRY OK";
+  if (humidity < warningLimitRh) return "CHECK !";
+  return "HUMID !!";
+}
+
+void drawStatusMarker(int16_t x, int16_t y, int16_t h, float humidity) {
+  const uint16_t color = statusColor(humidity);
+  tft.fillRoundRect(x, y, 13, h, 5, color);
+  if (humidity <= goodLimitRh) {
+    // Solid cyan bar.
+    return;
+  }
+  if (humidity < warningLimitRh) {
+    // Yellow diagonal stripes.
+    for (int16_t stripeY = y + 8; stripeY < y + h; stripeY += 12) {
+      tft.drawLine(x + 2, stripeY, x + 10, stripeY - 8, COLOR_PANEL);
+    }
+    return;
+  }
+  // Magenta cross pattern.
+  for (int16_t crossY = y + 8; crossY < y + h - 4; crossY += 14) {
+    tft.drawLine(x + 2, crossY - 4, x + 10, crossY + 4, COLOR_PANEL);
+    tft.drawLine(x + 10, crossY - 4, x + 2, crossY + 4, COLOR_PANEL);
+  }
 }
 
 bool online(const NodeState &node, uint32_t now) {
@@ -776,17 +807,16 @@ void drawHeader(const char *title, const char *right) {
   tft.setTextDatum(TL_DATUM);
 }
 
-void drawOverview() {
-  NodeState snapshot[DryBoxProtocol::NODE_COUNT];
-  portENTER_CRITICAL(&nodeMux);
-  memcpy(snapshot, nodes, sizeof(snapshot));
-  portEXIT_CRITICAL(&nodeMux);
-
-  const uint32_t now = millis();
-  tft.fillScreen(COLOR_BG);
+void drawOverviewHeader(const NodeState snapshot[], uint32_t now, bool force) {
   char countText[20];
   uint8_t onlineCount = 0;
-  for (const auto &node : snapshot) onlineCount += online(node, now) ? 1 : 0;
+  for (uint8_t i = 0; i < DryBoxProtocol::NODE_COUNT; ++i) {
+    onlineCount += online(snapshot[i], now) ? 1 : 0;
+  }
+  const int wifiStatusCode = static_cast<int>(WiFi.status());
+  if (!force && onlineCount == overviewRenderedOnlineCount && wifiStatusCode == overviewRenderedWifiStatus) return;
+  overviewRenderedOnlineCount = onlineCount;
+  overviewRenderedWifiStatus = wifiStatusCode;
   snprintf(countText, sizeof(countText), "%u/10 ONLINE", onlineCount);
   drawHeader("DRY BOXES", countText);
   tft.setTextColor(WiFi.status() == WL_CONNECTED ? COLOR_GOOD : COLOR_WARN, COLOR_HEADER);
@@ -794,44 +824,77 @@ void drawOverview() {
                                 ? "WiFi " + WiFi.localIP().toString()
                                 : (wifiSkippedAtStartup ? "WiFi offline mode" : "WiFi disconnected");
   tft.drawString(wifiStatus, 12, 39, 1);
+}
 
+void drawOverviewCard(const NodeState &node, uint8_t index, uint8_t row, uint32_t now) {
   constexpr int16_t firstY = 60;
   constexpr int16_t rowH = 70;
-  const uint8_t firstNode = overviewPage * 5;
-  for (uint8_t row = 0; row < 5; ++row) {
-    const uint8_t i = firstNode + row;
-    const int16_t y = firstY + row * rowH;
-    const bool isOnline = online(snapshot[i], now);
-    const bool sensorOk = isOnline && (snapshot[i].packet.flags & DryBoxProtocol::FLAG_SENSOR_OK);
-    uint16_t color = COLOR_MUTED;
-    if (sensorOk) color = statusColor(snapshot[i].packet.humidityRh);
+  const int16_t y = firstY + row * rowH;
+  const bool isOnline = online(node, now);
+  const bool sensorOk = isOnline && (node.packet.flags & DryBoxProtocol::FLAG_SENSOR_OK);
+  uint16_t color = sensorOk ? statusColor(node.packet.humidityRh) : COLOR_MUTED;
+  overviewRenderedOnline[index] = isOnline;
+  overviewRenderedSensorOk[index] = sensorOk;
 
-    tft.fillRoundRect(7, y, 306, 62, 7, COLOR_PANEL);
-    tft.fillRoundRect(7, y, 9, 62, 5, color);
-    tft.setTextColor(TFT_WHITE, COLOR_PANEL);
-    tft.drawString(nodeName(i), 24, y + 8, 4);
-
-    if (sensorOk) {
-      char value[32];
-      const float temperatureF = snapshot[i].packet.temperatureC * 9.0f / 5.0f + 32.0f;
-      snprintf(value, sizeof(value), "%.1f C / %.1f F", snapshot[i].packet.temperatureC, temperatureF);
-      tft.setTextColor(0xDFFF, COLOR_PANEL);
-      tft.drawString(value, 24, y + 38, 2);
-      snprintf(value, sizeof(value), "%.1f%%", snapshot[i].packet.humidityRh);
-      tft.setTextDatum(MR_DATUM);
-      tft.setTextColor(color, COLOR_PANEL);
-      tft.drawString(value, 298, y + 24, 4);
-      tft.setTextDatum(TL_DATUM);
-      tft.setTextColor(color, COLOR_PANEL);
-      tft.drawString(statusText(snapshot[i].packet.humidityRh), 196, y + 43, 2);
-    } else {
-      tft.setTextDatum(MR_DATUM);
-      tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
-      tft.drawString(isOnline ? "SENSOR ERROR" : "OFFLINE", 298, y + 29, 2);
-      tft.setTextDatum(TL_DATUM);
+  tft.fillRoundRect(7, y, 306, 62, 7, COLOR_PANEL);
+  if (sensorOk) {
+    drawStatusMarker(7, y, 62, node.packet.humidityRh);
+  } else {
+    tft.drawRoundRect(7, y, 13, 62, 5, COLOR_MUTED);
+    for (int16_t dashY = y + 5; dashY < y + 58; dashY += 10) {
+      tft.drawFastVLine(13, dashY, 5, COLOR_MUTED);
     }
   }
+  tft.setTextColor(TFT_WHITE, COLOR_PANEL);
+  tft.drawString(nodeName(index), 27, y + 8, 4);
 
+  if (sensorOk) {
+    char value[32];
+    const float temperatureF = node.packet.temperatureC * 9.0f / 5.0f + 32.0f;
+    snprintf(value, sizeof(value), "%.1f C / %.1f F", node.packet.temperatureC, temperatureF);
+    tft.setTextColor(0xDFFF, COLOR_PANEL);
+    tft.drawString(value, 27, y + 38, 2);
+    snprintf(value, sizeof(value), "%.1f%%", node.packet.humidityRh);
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(color, COLOR_PANEL);
+    tft.drawString(value, 298, y + 24, 4);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(color, COLOR_PANEL);
+    tft.drawString(statusText(node.packet.humidityRh), 188, y + 43, 2);
+  } else {
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+    tft.drawString(isOnline ? "SENSOR ERROR" : "OFFLINE", 298, y + 29, 2);
+    tft.setTextDatum(TL_DATUM);
+  }
+}
+
+void refreshOverview(uint16_t dirtyMask, bool force) {
+  NodeState snapshot[DryBoxProtocol::NODE_COUNT];
+  portENTER_CRITICAL(&nodeMux);
+  memcpy(snapshot, nodes, sizeof(snapshot));
+  portEXIT_CRITICAL(&nodeMux);
+  const uint32_t now = millis();
+  drawOverviewHeader(snapshot, now, force);
+  const uint8_t firstNode = overviewPage * 5;
+  for (uint8_t row = 0; row < 5; ++row) {
+    const uint8_t index = firstNode + row;
+    const bool isOnline = online(snapshot[index], now);
+    const bool sensorOk = isOnline && (snapshot[index].packet.flags & DryBoxProtocol::FLAG_SENSOR_OK);
+    const bool stateChanged =
+        isOnline != overviewRenderedOnline[index] || sensorOk != overviewRenderedSensorOk[index];
+    if (force || stateChanged || (dirtyMask & (1U << index))) {
+      drawOverviewCard(snapshot[index], index, row, now);
+    }
+  }
+}
+
+void drawOverview() {
+  portENTER_CRITICAL(&nodeMux);
+  overviewDirtyMask = 0;
+  portEXIT_CRITICAL(&nodeMux);
+  tft.fillScreen(COLOR_BG);
+  refreshOverview(UINT16_MAX, true);
   fillButton(5, 418, 66, 51, "1-5", 0x3186);
   fillButton(75, 418, 66, 51, "6-10", 0x3186);
   fillButton(145, 418, 82, 51, "WEATHER", 0x056B);
@@ -919,6 +982,57 @@ void drawWeather() {
   fillButton(216, 418, 96, 51, "REFRESH", 0x056B);
 }
 
+void drawDetail(uint8_t index);
+
+void drawDetailLiveValues(uint8_t index, const NodeState &node, uint32_t now) {
+  const bool isOnline = online(node, now);
+  const bool sensorOk = isOnline && (node.packet.flags & DryBoxProtocol::FLAG_SENSOR_OK);
+  if (isOnline != detailRenderedOnline || sensorOk != detailRenderedSensorOk) {
+    drawDetail(index);
+    return;
+  }
+  if (!sensorOk) return;
+
+  tft.fillRect(0, 55, SCREEN_WIDTH, 42, COLOR_BG);
+  tft.fillRect(0, 395, SCREEN_WIDTH, 20, COLOR_BG);
+  const uint16_t color = statusColor(node.packet.humidityRh);
+  char value[40];
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, COLOR_BG);
+  const float temperatureF = node.packet.temperatureC * 9.0f / 5.0f + 32.0f;
+  snprintf(value, sizeof(value), "%.1f C / %.1f F", node.packet.temperatureC, temperatureF);
+  tft.drawString(value, 10, 61, 4);
+  tft.setTextColor(color, COLOR_BG);
+  snprintf(value, sizeof(value), "%.1f%% RH", node.packet.humidityRh);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(value, 310, 64, 2);
+  tft.drawString(statusText(node.packet.humidityRh), 310, 80, 2);
+  tft.setTextDatum(TL_DATUM);
+  if (node.packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK) {
+    tft.setTextColor(COLOR_MUTED, COLOR_BG);
+    snprintf(value, sizeof(value), "%.1f hPa", node.packet.pressureHpa);
+    tft.drawString(value, 10, 87, 1);
+  }
+  tft.setTextColor(COLOR_MUTED, COLOR_BG);
+  snprintf(value, sizeof(value), "Packet %lu  Age %lus", static_cast<unsigned long>(node.packet.sequence),
+           static_cast<unsigned long>((now - node.receivedMs) / 1000));
+  tft.drawString(value, 31, 402, 1);
+}
+
+void drawDetailLive(uint8_t index) {
+  NodeState node;
+  NodeHistory history;
+  portENTER_CRITICAL(&nodeMux);
+  node = nodes[index];
+  history = nodeHistory[index];
+  portEXIT_CRITICAL(&nodeMux);
+  if (history.lastBucket != detailRenderedBucket) {
+    drawDetail(index);
+    return;
+  }
+  drawDetailLiveValues(index, node, millis());
+}
+
 void drawDetail(uint8_t index) {
   NodeState node;
   NodeHistory history;
@@ -927,6 +1041,9 @@ void drawDetail(uint8_t index) {
   history = nodeHistory[index];
   portEXIT_CRITICAL(&nodeMux);
   const uint32_t now = millis();
+  detailRenderedBucket = history.lastBucket;
+  detailRenderedOnline = online(node, now);
+  detailRenderedSensorOk = detailRenderedOnline && (node.packet.flags & DryBoxProtocol::FLAG_SENSOR_OK);
 
   tft.fillScreen(COLOR_BG);
   drawHeader(nodeName(index), online(node, now) ? "ONLINE" : "OFFLINE");
@@ -947,31 +1064,9 @@ void drawDetail(uint8_t index) {
     return;
   }
 
-  const uint16_t color = statusColor(node.packet.humidityRh);
-  char value[40];
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(TFT_WHITE, COLOR_BG);
-  const float temperatureF = node.packet.temperatureC * 9.0f / 5.0f + 32.0f;
-  snprintf(value, sizeof(value), "%.1f C / %.1f F", node.packet.temperatureC, temperatureF);
-  tft.drawString(value, 10, 61, 4);
-  tft.setTextColor(color, COLOR_BG);
-  snprintf(value, sizeof(value), "%.1f%% RH", node.packet.humidityRh);
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(value, 310, 64, 2);
-  tft.drawString(statusText(node.packet.humidityRh), 310, 80, 2);
-  tft.setTextDatum(TL_DATUM);
-  if (node.packet.flags & DryBoxProtocol::FLAG_PRESSURE_OK) {
-    tft.setTextColor(COLOR_MUTED, COLOR_BG);
-    snprintf(value, sizeof(value), "%.1f hPa", node.packet.pressureHpa);
-    tft.drawString(value, 10, 87, 1);
-  }
   drawHistoryPlot(history, true, 98, COLOR_WARN);
   drawHistoryPlot(history, false, 250, 0x07FF);
-  tft.setTextColor(COLOR_MUTED, COLOR_BG);
-  snprintf(value, sizeof(value), "Packet %lu  Age %lus", static_cast<unsigned long>(node.packet.sequence),
-           static_cast<unsigned long>((now - node.receivedMs) / 1000));
-  tft.drawString(value, 31, 402, 1);
-  tft.setTextDatum(TL_DATUM);
+  drawDetailLiveValues(index, node, now);
 }
 
 void drawSettings() {
@@ -1225,7 +1320,7 @@ void sendJsonStatus() {
 void sendWebDashboard() {
   String page = F(R"HTML(<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Dry Box Monitor</title><style>
-body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border-left:7px solid #60747e;border-radius:9px;padding:14px}.good{border-color:#20c970}.warn{border-color:#ffab23}.bad{border-color:#ef4444}.off{opacity:.65}.value{font-size:29px;font-weight:700}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}</style></head><body>
+body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border:3px solid #60747e;border-left-width:12px;border-radius:9px;padding:14px}.good{border-color:#00e5ff}.warn{border-color:#ffe600;border-style:double}.bad{border-color:#ff4dff;border-style:dashed}.off{opacity:.65}.value{font-size:29px;font-weight:700}.state{font-size:18px;font-weight:800;letter-spacing:.08em}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}</style></head><body>
 <h1>ACE Dry Box Monitor</h1><p class=sub id=connection>Loading...</p><div class=grid id=nodes></div>
 <div class=panel><h2>Node setup</h2><p>Select an empty slot on the touchscreen, or start pairing here:</p><span id=pairButtons></span></div>
 <div class=panel><h2>Weather setup</h2><form method=post action=/weather-settings><label>OpenWeather API key </label><input type=password name=key placeholder="Leave blank to keep saved key"><br><label>Location </label><input name=place value=")HTML");
@@ -1250,7 +1345,7 @@ body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margi
 async function post(url){await fetch(url,{method:'POST'});setTimeout(load,300)}
 async function load(){try{let d=await(await fetch('/api/status',{cache:'no-store'})).json();connection.textContent='http://'+d.hostname+'.local  |  '+d.ip+'  |  Wi-Fi channel '+d.channel+'  |  FW '+d.firmwareVersion+' ('+d.gitCommit+')';
 storage.textContent=!d.sdReady?'SD card missing':d.sdStorageFull?'SD card full':d.sdCleanupActive?'SD cleanup active — '+(d.sdFreeMB/1024).toFixed(1)+' GB free':'SD card — '+(d.sdFreeMB/1024).toFixed(1)+' GB free of '+(d.sdTotalMB/1024).toFixed(1)+' GB; '+d.sdDeletedLogs+' old logs deleted';
-nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?(n.online?'SENSOR ERROR':'OFFLINE'):'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
+nodes.innerHTML=d.nodes.map(n=>{let cls=!n.online?'off':!n.sensorOk?'bad':n.humidityRh<=d.goodLimitRh?'good':n.humidityRh<d.warningLimitRh?'warn':'bad';let state=!n.online?'OFFLINE':!n.sensorOk?'SENSOR ERROR':n.humidityRh<=d.goodLimitRh?'✓ DRY OK':n.humidityRh<d.warningLimitRh?'! CHECK':'!! HUMID';let f=n.temperatureC*9/5+32;let v=n.sensorOk?`<div class=state>${state}</div><div class=value>${n.temperatureC.toFixed(1)} C / ${f.toFixed(1)} F &nbsp; ${n.humidityRh.toFixed(1)}% RH</div><div class=meta>Packet ${n.sequence}, ${n.ageSeconds}s ago</div>`:`<div class=value>${n.paired?state:'NOT PAIRED'}</div>`;return `<div class="card ${cls}"><h2>${n.name}</h2>${v}${n.paired?`<button class=danger onclick="post('/unpair?slot=${n.id}')">Unpair</button>`:''}</div>`}).join('');
 pairButtons.innerHTML=d.nodes.filter(n=>!n.paired).map(n=>`<button onclick="post('/pair?slot=${n.id}')">Pair ${n.name}</button>`).join('')||'All slots are paired.';}catch(e){connection.textContent='Controller unavailable';}}load();setInterval(load,3000);
 </script></body></html>)HTML");
   webServer.send(200, "text/html", page);
@@ -1543,6 +1638,7 @@ void onPacket(const uint8_t *sourceMac, const uint8_t *data, int length) {
   node.receivedMs = millis();
   node.received = true;
   ++validPacketCount;
+  overviewDirtyMask |= 1U << slot;
   packetPendingRedraw = true;
   const uint32_t packetTime = millis();
   if (packetTime - lastAckQueuedMs[slot] >= 500 && ackQueueCount < DryBoxProtocol::NODE_COUNT) {
@@ -1781,7 +1877,17 @@ void loop() {
   if (!settingsScreen && (packetRefresh || now - lastRedrawMs >= refreshInterval)) {
     packetPendingRedraw = false;
     lastRedrawMs = now;
-    redraw();
+    if (detailNode >= 0) {
+      drawDetailLive(detailNode);
+    } else if (!weatherScreen && !pairingScreen) {
+      portENTER_CRITICAL(&nodeMux);
+      const uint16_t dirtyMask = overviewDirtyMask;
+      overviewDirtyMask = 0;
+      portEXIT_CRITICAL(&nodeMux);
+      refreshOverview(dirtyMask, false);
+    } else {
+      redraw();
+    }
   }
   delay(10);
 }
