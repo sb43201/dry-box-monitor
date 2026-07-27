@@ -212,11 +212,13 @@ void sendPairRequest() {
   request.nonce = pairingNonce;
   request.checksum = DryBoxProtocol::messageChecksum(request);
   for (uint8_t attempt = 0; attempt < 2; ++attempt) {
-    const uint8_t *destination = controllerMac[0] || controllerMac[1] ? controllerMac : BROADCAST_MAC;
-    const int result = esp_now_send(const_cast<uint8_t *>(destination), reinterpret_cast<uint8_t *>(&request),
+    // The controller cannot reliably acknowledge ESP8266 unicast until it has
+    // received this request and added the new node as a peer. Keep the initial
+    // handshake broadcast; the pairing response and readings use unicast.
+    const int result = esp_now_send(const_cast<uint8_t *>(BROADCAST_MAC), reinterpret_cast<uint8_t *>(&request),
                                     sizeof(request));
-    Serial.printf("[pair] request channel=%u attempt=%u send=%d nonce=%lu\n", pairingChannel, attempt + 1, result,
-                  static_cast<unsigned long>(pairingNonce));
+    Serial.printf("[pair] broadcast request channel=%u attempt=%u send=%d nonce=%lu\n", pairingChannel, attempt + 1,
+                  result, static_cast<unsigned long>(pairingNonce));
     delay(50);
   }
   pairingChannel = pairingChannel >= 13 ? 1 : pairingChannel + 1;
