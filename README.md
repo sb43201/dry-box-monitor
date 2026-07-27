@@ -170,6 +170,18 @@ Wemos D1 Mini ESP8266:
 
 For example, replace both occurrences of `COM11` with `COM16` when the node is connected to COM16.
 
+Copy-and-paste ESP8266 erase example for COM16:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t erase --upload-port COM16
+```
+
+Then upload the ESP8266 firmware to the same port:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe" run -e sensor_wemos_d1_esp8266 -t upload --upload-port COM16
+```
+
 The ESP8266 does not use GPIO0 as a runtime unpair input, so controller **Unpair** or full erase/re-upload are its recovery methods. After erasing either board, clear the previous slot on the controller, start pairing on an empty slot, and restart the node.
 
 ## Operation
