@@ -78,7 +78,7 @@ constexpr uint16_t COLOR_MUTED = 0xAD55;
 // so meaning never depends on color alone.
 constexpr uint16_t COLOR_GOOD = 0x07FF;  // cyan
 constexpr uint16_t COLOR_WARN = 0xFFE0;  // yellow
-constexpr uint16_t COLOR_BAD = 0xF81F;   // magenta
+constexpr uint16_t COLOR_BAD = 0xF800;   // bright red
 
 struct NodeState {
   DryBoxProtocol::SensorPacket packet{};
@@ -423,7 +423,7 @@ void drawStatusMarker(int16_t x, int16_t y, int16_t h, float humidity) {
     }
     return;
   }
-  // Magenta cross pattern.
+  // Red cross pattern.
   for (int16_t crossY = y + 8; crossY < y + h - 4; crossY += 14) {
     tft.drawLine(x + 2, crossY - 4, x + 10, crossY + 4, COLOR_PANEL);
     tft.drawLine(x + 10, crossY - 4, x + 2, crossY + 4, COLOR_PANEL);
@@ -1320,7 +1320,7 @@ void sendJsonStatus() {
 void sendWebDashboard() {
   String page = F(R"HTML(<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1">
 <title>Dry Box Monitor</title><style>
-body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border:3px solid #60747e;border-left-width:12px;border-radius:9px;padding:14px}.good{border-color:#00e5ff}.warn{border-color:#ffe600;border-style:double}.bad{border-color:#ff4dff;border-style:dashed}.off{opacity:.65}.value{font-size:29px;font-weight:700}.state{font-size:18px;font-weight:800;letter-spacing:.08em}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}</style></head><body>
+body{font:16px system-ui;background:#07131b;color:#eef7fa;max-width:1050px;margin:auto;padding:18px}h1{margin-bottom:4px}.sub{color:#9fb2bd;margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:#12242e;border:3px solid #60747e;border-left-width:12px;border-radius:9px;padding:14px}.good{border-color:#00e5ff}.warn{border-color:#ffe600;border-style:double}.bad{border-color:#ff2020;border-style:dashed}.off{opacity:.65}.value{font-size:29px;font-weight:700}.state{font-size:18px;font-weight:800;letter-spacing:.08em}.meta{color:#9fb2bd}button,input{padding:10px;margin:5px;border:0;border-radius:6px}button{background:#237da0;color:white;font-weight:700}.danger{background:#b33131}.panel{background:#12242e;padding:14px;border-radius:9px;margin-top:16px}</style></head><body>
 <h1>ACE Dry Box Monitor</h1><p class=sub id=connection>Loading...</p><div class=grid id=nodes></div>
 <div class=panel><h2>Node setup</h2><p>Select an empty slot on the touchscreen, or start pairing here:</p><span id=pairButtons></span></div>
 <div class=panel><h2>Weather setup</h2><form method=post action=/weather-settings><label>OpenWeather API key </label><input type=password name=key placeholder="Leave blank to keep saved key"><br><label>Location </label><input name=place value=")HTML");
