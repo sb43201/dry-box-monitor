@@ -192,6 +192,7 @@ WeatherClient weatherClient;
 WeatherData weatherData;
 String weatherError;
 uint32_t lastWeatherAttemptMs = 0;
+uint32_t lastWeatherClockMinute = UINT32_MAX;
 uint32_t lastPairBeaconMs = 0;
 uint32_t wifiDisconnectedSinceMs = 0;
 uint32_t lastWifiReconnectAttemptMs = 0;
@@ -901,15 +902,49 @@ void drawOverview() {
   fillButton(231, 418, 84, 51, "SET", 0x3186);
 }
 
-void drawWeather() {
-  tft.fillScreen(COLOR_BG);
-  char dateTime[24] = "TIME SYNCING";
+void drawWeatherClock(bool force) {
   const time_t now = time(nullptr);
+  const uint32_t clockMinute = now > 100000 ? static_cast<uint32_t>(now / 60) : 0;
+  if (!force && clockMinute == lastWeatherClockMinute) return;
+  lastWeatherClockMinute = clockMinute;
+  char dateTime[24] = "TIME SYNCING";
   tm localTime{};
   if (now > 100000 && localtime_r(&now, &localTime)) {
     strftime(dateTime, sizeof(dateTime), "%b %d %I:%M %p", &localTime);
   }
-  drawHeader(weatherLocation.c_str(), dateTime);
+  tft.fillRect(150, 0, SCREEN_WIDTH - 150, 52, COLOR_HEADER);
+  tft.setTextDatum(MR_DATUM);
+  tft.setTextColor(TFT_WHITE, COLOR_HEADER);
+  tft.drawString(dateTime, 308, 26, 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+void drawWeatherRoomPanel() {
+  tft.fillRoundRect(8, 184, 304, 72, 7, COLOR_PANEL);
+  tft.setTextColor(COLOR_GOOD, COLOR_PANEL);
+  tft.drawString("ROOM - LOCAL SENSOR", 18, 194, 2);
+  if (localReading.bmpOk) {
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
+    tft.drawString(String(localReading.pressureHpa, 0) + " hPa", 298, 204, 2);
+    tft.setTextDatum(TL_DATUM);
+  }
+  tft.setTextColor(TFT_WHITE, COLOR_PANEL);
+  if (localReading.ahtOk) {
+    const float roomTempF = localReading.temperatureC * 9.0f / 5.0f + 32.0f;
+    char roomValue[48];
+    snprintf(roomValue, sizeof(roomValue), "%.1f C / %.1f F   %.1f%%", localReading.temperatureC, roomTempF,
+             localReading.humidityRh);
+    tft.drawString(roomValue, 18, 220, 4);
+  } else {
+    tft.drawString("Sensor offline", 18, 220, 4);
+  }
+}
+
+void drawWeather() {
+  tft.fillScreen(COLOR_BG);
+  drawHeader(weatherLocation.c_str(), nullptr);
+  drawWeatherClock(true);
   const char unit = weatherImperial ? 'F' : 'C';
   if (!weatherApiKey.length()) {
     tft.setTextColor(COLOR_WARN, COLOR_BG);
@@ -937,25 +972,7 @@ void drawWeather() {
     tft.drawString(value, 16, 153, 2);
   }
 
-  tft.fillRoundRect(8, 184, 304, 72, 7, COLOR_PANEL);
-  tft.setTextColor(COLOR_GOOD, COLOR_PANEL);
-  tft.drawString("ROOM - LOCAL SENSOR", 18, 194, 2);
-  if (localReading.bmpOk) {
-    tft.setTextDatum(MR_DATUM);
-    tft.setTextColor(COLOR_MUTED, COLOR_PANEL);
-    tft.drawString(String(localReading.pressureHpa, 0) + " hPa", 298, 204, 2);
-    tft.setTextDatum(TL_DATUM);
-  }
-  tft.setTextColor(TFT_WHITE, COLOR_PANEL);
-  if (localReading.ahtOk) {
-    const float roomTempF = localReading.temperatureC * 9.0f / 5.0f + 32.0f;
-    char roomValue[48];
-    snprintf(roomValue, sizeof(roomValue), "%.1f C / %.1f F   %.1f%%", localReading.temperatureC, roomTempF,
-             localReading.humidityRh);
-    tft.drawString(roomValue, 18, 220, 4);
-  } else {
-    tft.drawString("Sensor offline", 18, 220, 4);
-  }
+  drawWeatherRoomPanel();
 
   for (uint8_t i = 0; i < 4; ++i) {
     const int16_t x = 5 + i * 79;
@@ -1921,8 +1938,9 @@ void loop() {
   }
   if (now - lastLocalSensorMs >= LOCAL_SENSOR_INTERVAL_MS) {
     readLocalSensor();
-    if (weatherScreen) redraw();
+    if (weatherScreen) drawWeatherRoomPanel();
   }
+  if (weatherScreen) drawWeatherClock(false);
   if (WiFi.status() == WL_CONNECTED && weatherApiKey.length() &&
       (lastWeatherAttemptMs == 0 || now - lastWeatherAttemptMs >= WEATHER_INTERVAL_MS)) {
     lastWeatherAttemptMs = now;
@@ -1935,7 +1953,7 @@ void loop() {
   }
   const uint32_t refreshInterval = detailNode >= 0 ? DETAIL_REFRESH_MS : OVERVIEW_REFRESH_MS;
   const bool packetRefresh = packetPendingRedraw && now - lastRedrawMs >= PACKET_REDRAW_DELAY_MS;
-  if (!settingsScreen && (packetRefresh || now - lastRedrawMs >= refreshInterval)) {
+  if (!settingsScreen && !weatherScreen && (packetRefresh || now - lastRedrawMs >= refreshInterval)) {
     packetPendingRedraw = false;
     lastRedrawMs = now;
     if (detailNode >= 0) {
